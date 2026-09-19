@@ -1,0 +1,28 @@
+# Distributed Inventory Management System -- runtime dependencies
+#
+# Milestone 1, storage/database foundation.
+#
+# This lists only packages the implemented source actually imports. The
+# gRPC services, Streamlit client, Ollama/LLM server and forecasting code
+# are not written yet, so grpcio, grpcio-tools, streamlit, ollama, pandas,
+# numpy and plotly are deliberately absent; add each one in the phase that
+# introduces it.
+#
+# Pinned to the versions verified working on Python 3.12.10.
+# Transitive dependencies (greenlet, typing-extensions, pluggy, ...) are
+# resolved by pip and intentionally left unpinned.
+
+# ORM and SQLite access.
+# Used by app/storage/{database,models,repositories}.py, both scripts and
+# the test suite. 2.x is required: the models use the Mapped[] /
+# mapped_column() declarative style and select()-based queries.
+SQLAlchemy==2.0.54
+
+# Password hashing for the seeded demo admin user.
+# Used by scripts/seed_data.py; plaintext passwords are never stored.
+bcrypt==5.0.0
+
+# Test runner and fixtures for tests/.
+# A development dependency, kept here so a single install prepares a
+# working checkout.
+pytest==9.1.1

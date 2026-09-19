@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+.env
+
+data/*.db
+
+.vscode/
+
+proto/*_pb2.py
+proto/*_pb2_grpc.py
