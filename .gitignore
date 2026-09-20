@@ -14,3 +14,7 @@ data/*.db
 
 proto/*_pb2.py
 proto/*_pb2_grpc.py
+
+# SQLite WAL sidecar files, created whenever a WAL-mode database is opened.
+data/*.db-wal
+data/*.db-shm

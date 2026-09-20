@@ -2,11 +2,11 @@
 #
 # Milestone 1, storage/database foundation.
 #
-# This lists only packages the implemented source actually imports. The
-# gRPC services, Streamlit client, Ollama/LLM server and forecasting code
-# are not written yet, so grpcio, grpcio-tools, streamlit, ollama, pandas,
-# numpy and plotly are deliberately absent; add each one in the phase that
-# introduces it.
+# This lists only packages the implemented source actually imports, plus the
+# protobuf toolchain needed to compile proto/client.proto. The Streamlit
+# client, Ollama/LLM server and forecasting code are not written yet, so
+# streamlit, ollama, pandas, numpy and plotly are deliberately absent; add
+# each one in the phase that introduces it.
 #
 # Pinned to the versions verified working on Python 3.12.10.
 # Transitive dependencies (greenlet, typing-extensions, pluggy, ...) are
@@ -21,6 +21,20 @@ SQLAlchemy==2.0.54
 # Password hashing for the seeded demo admin user.
 # Used by scripts/seed_data.py; plaintext passwords are never stored.
 bcrypt==5.0.0
+
+# gRPC runtime: the application server and client channels.
+grpcio==1.84.0
+
+# Protobuf compiler (protoc) plus the gRPC Python plugin, used by the
+# codegen step that turns proto/*.proto into the generated stubs. Needed at
+# build time rather than at run time, but kept here so one install prepares
+# a checkout that can regenerate stubs (which are gitignored, not committed).
+grpcio-tools==1.84.0
+
+# Protobuf runtime backing the generated message classes. grpcio-tools
+# declares protobuf>=7.35.1,<8.0.0; this is the version resolved into the
+# working environment.
+protobuf==7.36.2
 
 # Test runner and fixtures for tests/.
 # A development dependency, kept here so a single install prepares a

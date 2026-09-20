@@ -1,0 +1,194 @@
+// Client-facing gRPC contract for the Distributed Inventory Management System.
+//
+// This is the ONLY entry point a client has into the system: per the project
+// constraints the client never touches a node's SQLite database directly, and
+// all client-to-node communication happens over the RPCs defined here.
+//
+// Scope of this contract today (Phase E) is authentication and session
+// handling. The three generic data RPCs (post/get/processBusinessRequest) are
+// defined now but carry their domain payloads as google.protobuf.Struct, so
+// that adding inventory, order or supplier operations later needs new handler
+// code rather than a new wire contract.
+//
+// Conventions:
+//   * Method names are kept exactly as the course assignment writes them
+//     (lowercase login/logout/post/get, camelCase processBusinessRequest).
+//     This deviates from the protobuf style guide's PascalCase on purpose:
+//     the assignment's "Function Signatures" section is the graded contract.
+//   * Every RPC except login requires a session_token issued by login.
+//   * Field numbers 1-15 encode in a single byte, so the fields sent on every
+//     request (session_token first) are kept in that range.
+//   * No password and no password hash is ever present in a response message.
+
+syntax = "proto3";
+
+package inventory.client.v1;
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+// Operations a client (Streamlit UI, test harness, load generator) may invoke
+// against an application node.
+service ClientService {
+  // Exchange username + password for a session token. The only unauthenticated
+  // RPC in this service.
+  rpc login(LoginRequest) returns (LoginResponse);
+
+  // Revoke the caller's session token. Idempotent: logging out an already
+  // revoked or unknown token reports failure but never errors.
+  rpc logout(LogoutRequest) returns (StatusResponse);
+
+  // Submit new data to the node (assignment: post(token, type, data)).
+  // Authenticated; the concrete resources are added in later phases.
+  rpc post(PostRequest) returns (StatusResponse);
+
+  // Read data from the node (assignment: get(token, type, Optional(params))).
+  // Authenticated; returns a list of (id, data) items.
+  rpc get(GetRequest) returns (GetResponse);
+
+  // Perform a domain operation (assignment: processBusinessRequest(requestId,
+  // payload, context)). Authenticated. In Milestone 2 the operations reaching
+  // this RPC become the commands replicated through the Raft log, which is why
+  // it carries an explicit request_id.
+  rpc processBusinessRequest(BusinessRequest) returns (BusinessResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Shared messages
+// ---------------------------------------------------------------------------
+
+// Non-sensitive projection of a row in the Phase D `users` table.
+// password_hash is deliberately absent and must never be added here.
+message UserInfo {
+  int64 id = 1;         // users.id
+  string username = 2;  // users.username (unique)
+  string email = 3;     // users.email (unique)
+  string role = 4;      // users.role -- one of "admin", "manager", "staff"
+  bool is_active = 5;   // users.is_active; an inactive user cannot log in
+}
+
+// Generic success/failure reply used by RPCs that return no data.
+// `message` is human-readable only -- clients must branch on `success`.
+message StatusResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// One record returned by `get`, matching the assignment's List[(id, data)].
+message DataItem {
+  string id = 1;                   // stable identifier of the record
+  google.protobuf.Struct data = 2; // record fields, shape depends on the resource
+}
+
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
+
+message LoginRequest {
+  string username = 1;
+  // Plaintext password, in transit only. It is verified against the stored
+  // bcrypt hash and is never persisted, logged, or echoed back to the client.
+  string password = 2;
+}
+
+message LoginResponse {
+  bool success = 1;
+
+  // Raw session token, returned exactly once and only on success. The server
+  // stores just its hash (sessions.token_hash), so this value cannot be
+  // recovered afterwards; a client that loses it must log in again.
+  // `optional` gives explicit presence, matching the assignment's
+  // loginResponse(status, Optional(token)).
+  optional string session_token = 2;
+
+  // Human-readable outcome. On failure this is intentionally generic so the
+  // RPC cannot be used to distinguish "no such user" from "wrong password".
+  string message = 3;
+
+  // Populated on success so the client can render the user and apply
+  // role-based UI rules without a second round trip.
+  UserInfo user = 4;
+
+  // When the returned token stops being valid (sessions.expires_at), letting
+  // the client refresh before an operation fails.
+  google.protobuf.Timestamp expires_at = 5;
+}
+
+message LogoutRequest {
+  string session_token = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Generic data operations
+// ---------------------------------------------------------------------------
+
+message PostRequest {
+  string session_token = 1;
+
+  // What is being written -- the assignment's `type` argument, named here for
+  // clarity. Later phases route on values such as "order" or "restock".
+  string resource = 2;
+
+  // The record to write. A Struct rather than a JSON string so the payload
+  // stays self-describing on the wire and needs no manual encode/decode step.
+  google.protobuf.Struct payload = 3;
+}
+
+message GetRequest {
+  string session_token = 1;
+
+  // What is being read -- the assignment's `type` argument. Later phases route
+  // on values such as "inventory" or "product".
+  string resource = 2;
+
+  // Optional filters (the assignment's Optional(params)), e.g. a warehouse
+  // code or a paging cursor. An absent Struct means "no filters".
+  google.protobuf.Struct params = 3;
+}
+
+message GetResponse {
+  bool success = 1;
+  string message = 2;
+  repeated DataItem items = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Domain operations
+// ---------------------------------------------------------------------------
+
+message BusinessRequest {
+  string session_token = 1;
+
+  // Which domain operation to run, e.g. "place_order" in a later phase.
+  string operation = 2;
+
+  // Operation arguments.
+  google.protobuf.Struct payload = 3;
+
+  // Caller-supplied correlation id (the assignment's requestId). It lets a
+  // client retry safely after a timeout and, in Milestone 2, identifies the
+  // command in the replicated log so a retry is not applied twice.
+  string request_id = 4;
+
+  // Ambient request metadata (the assignment's context), e.g. the originating
+  // warehouse. Kept separate from payload so operation arguments and routing
+  // information do not get mixed together.
+  google.protobuf.Struct context = 5;
+}
+
+message BusinessResponse {
+  bool success = 1;
+  string message = 2;
+
+  // Operation result. Struct rather than a fixed message because each
+  // operation returns a different shape.
+  google.protobuf.Struct data = 3;
+
+  // Echoes BusinessRequest.request_id so a client can match replies to
+  // in-flight requests.
+  string request_id = 4;
+}
