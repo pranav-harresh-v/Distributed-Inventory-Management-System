@@ -14,6 +14,7 @@ business operation succeed or fail atomically. Nothing here catches
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 from decimal import Decimal
 from typing import Generic, TypeVar
 
@@ -30,6 +31,9 @@ from app.storage.models import (
     User,
     Warehouse,
 )
+from app.storage.models import (
+    Session as SessionRecord,
+)
 
 ModelT = TypeVar("ModelT", bound=Base)
 
@@ -37,6 +41,7 @@ __all__ = [
     "BaseRepository",
     "InventoryRepository",
     "ProductRepository",
+    "SessionRepository",
     "SupplierProductRepository",
     "SupplierRepository",
     "UserRepository",
@@ -119,6 +124,71 @@ class UserRepository(BaseRepository[User]):
                 is_active=is_active,
             )
         )
+
+
+class SessionRepository(BaseRepository[SessionRecord]):
+    """Login-session access.
+
+    Only ever handles the *hash* of a session token; the raw token exists
+    solely in the login response. ``sessions`` has no ``is_active`` column,
+    so :meth:`list` drops the filter it would otherwise inherit.
+    """
+
+    model = SessionRecord
+
+    def list(
+        self,
+        *,
+        active_only: bool = False,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> Sequence[SessionRecord]:
+        stmt = select(SessionRecord).order_by(SessionRecord.id)
+        if offset is not None:
+            stmt = stmt.offset(offset)
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return self.session.scalars(stmt).all()
+
+    def get_by_token_hash(self, token_hash: str) -> SessionRecord | None:
+        """Look up a session by token hash.
+
+        ``sessions.token_hash`` is unique and indexed, so this is a single
+        index probe -- which is why session tokens are hashed with a fast
+        deterministic digest rather than a salted one.
+        """
+        return self.session.scalars(
+            select(SessionRecord).where(SessionRecord.token_hash == token_hash)
+        ).one_or_none()
+
+    def list_for_user(self, user_id: int) -> Sequence[SessionRecord]:
+        return self.session.scalars(
+            select(SessionRecord)
+            .where(SessionRecord.user_id == user_id)
+            .order_by(SessionRecord.id)
+        ).all()
+
+    def create(
+        self,
+        *,
+        user_id: int,
+        token_hash: str,
+        expires_at: datetime,
+    ) -> SessionRecord:
+        """Insert a new session. ``revoked`` defaults to False."""
+        return self.add(
+            SessionRecord(
+                user_id=user_id,
+                token_hash=token_hash,
+                expires_at=expires_at,
+            )
+        )
+
+    def revoke(self, record: SessionRecord) -> SessionRecord:
+        """Mark one session revoked, leaving every other session alone."""
+        record.revoked = True
+        self.session.flush()
+        return record
 
 
 class ProductRepository(BaseRepository[Product]):

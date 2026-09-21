@@ -60,6 +60,7 @@ __all__ = [
     "SupplierProduct",
     "User",
     "Warehouse",
+    "ensure_utc",
     "utc_now",
 ]
 
@@ -98,6 +99,19 @@ ZERO_MONEY: Final[Decimal] = Decimal("0.00")
 def utc_now() -> datetime:
     """Current time as a timezone-aware UTC datetime."""
     return datetime.now(timezone.utc)
+
+
+def ensure_utc(value: datetime) -> datetime:
+    """Interpret a stored timestamp as timezone-aware UTC.
+
+    SQLite has no native timezone type, so a value written as aware UTC is
+    read back naive. Comparing such a value against :func:`utc_now` raises
+    ``TypeError: can't compare offset-naive and offset-aware datetimes``, so
+    every timestamp loaded from the database goes through this first.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 class Money(TypeDecorator[Decimal]):

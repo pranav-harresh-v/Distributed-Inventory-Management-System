@@ -21,6 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from app.domain import auth
 from app.storage.database import (
     create_db_engine,
     create_session_factory,
@@ -28,6 +29,9 @@ from app.storage.database import (
     sqlite_url_for_path,
 )
 from app.storage.models import Product, User, Warehouse
+
+#: Password behind the `auth_user` fixture. Test-only, never seeded.
+TEST_PASSWORD = "correct horse battery staple"
 
 
 @pytest.fixture
@@ -88,3 +92,23 @@ def warehouse(session: Session) -> Warehouse:
     session.add(record)
     session.flush()
     return record
+
+
+@pytest.fixture
+def auth_user(session_factory: sessionmaker[Session]) -> User:
+    """A committed user whose password is :data:`TEST_PASSWORD`.
+
+    Committed rather than flushed, because the code under test opens its own
+    sessions and must be able to see this row.
+    """
+    with session_factory() as db:
+        record = User(
+            username="operator",
+            email="operator@example.com",
+            password_hash=auth.hash_password(TEST_PASSWORD),
+            role="manager",
+        )
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+        return record

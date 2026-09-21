@@ -28,9 +28,9 @@ from pathlib import Path
 # as a module (``python scripts/seed_data.py``).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import bcrypt
 from sqlalchemy.orm import Session
 
+from app.domain import auth
 from app.storage.database import get_database_path, init_db, session_scope
 from app.storage.models import ADMIN_ROLE
 from app.storage.repositories import (
@@ -118,8 +118,13 @@ SUPPLIER_PRODUCTS: tuple[tuple[str, str, str, Decimal, int, int, bool], ...] = (
 
 
 def hash_password(plaintext: str) -> str:
-    """Return a bcrypt hash. Plaintext never leaves this function."""
-    return bcrypt.hashpw(plaintext.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    """Return a bcrypt hash of ``plaintext``.
+
+    Delegates to the domain helper so the seeded admin is hashed by exactly
+    the same code that verifies it at login. A second bcrypt call here could
+    drift from that one and silently make the demo account unusable.
+    """
+    return auth.hash_password(plaintext)
 
 
 def seed_admin_user(session: Session) -> bool:
