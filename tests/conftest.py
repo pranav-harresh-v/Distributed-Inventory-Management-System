@@ -34,6 +34,32 @@ from app.storage.models import Product, User, Warehouse
 TEST_PASSWORD = "correct horse battery staple"
 
 
+@pytest.fixture(scope="session", autouse=True)
+def protect_the_node_database() -> Iterator[None]:
+    """Fail the run if the suite writes to the real node database.
+
+    Every fixture here builds a database under tmp_path, but a stray import
+    of the module-level `engine` would quietly target data/node1.db. This
+    compares the file's size and mtime across the session so that mistake
+    surfaces as a test failure rather than corrupted development data.
+    """
+    from app.storage.database import get_database_path
+
+    node_db = get_database_path()
+    before = node_db.stat() if node_db.exists() else None
+    yield
+    after = node_db.stat() if node_db.exists() else None
+
+    if before is None:
+        assert after is None, f"the test suite created {node_db}"
+        return
+    assert after is not None, f"the test suite deleted {node_db}"
+    assert (before.st_size, before.st_mtime_ns) == (
+        after.st_size,
+        after.st_mtime_ns,
+    ), f"the test suite modified {node_db}"
+
+
 @pytest.fixture
 def db_path(tmp_path: Path) -> Path:
     """Path of the temporary database file for one test."""

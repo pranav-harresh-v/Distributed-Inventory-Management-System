@@ -13,17 +13,20 @@ credential, hash or stack trace crosses the wire.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from typing import Final, NoReturn
+from typing import Any, Final, NoReturn
 
 import grpc
+from google.protobuf.json_format import MessageToDict
+from google.protobuf.struct_pb2 import Struct
 from google.protobuf.timestamp_pb2 import Timestamp
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session as DbSession
 from sqlalchemy.orm import sessionmaker
 
-from app.domain import auth
+from app.domain import auth, inventory, orders
+from app.domain.inventory import CatalogError
 from app.storage.database import SessionLocal, session_scope
 from app.storage.models import User
 from proto import client_pb2, client_pb2_grpc
@@ -74,6 +77,203 @@ def _to_timestamp(value) -> Timestamp:
     timestamp = Timestamp()
     timestamp.FromDatetime(value)
     return timestamp
+
+
+def _struct_to_dict(payload: Struct) -> dict[str, Any]:
+    """Convert an inbound Struct to plain Python.
+
+    Numbers arrive as doubles and are re-typed by the domain validators;
+    nothing here assumes a shape.
+    """
+    return MessageToDict(payload)
+
+
+def _data_item(record_id: int, payload: dict[str, Any]) -> client_pb2.DataItem:
+    """Build one DataItem from an already-serialized row.
+
+    ``DataItem.id`` is the canonical identifier, and ``data`` carries the
+    Struct-safe projection built by the domain layer -- the ORM object
+    itself never reaches protobuf.
+    """
+    item = client_pb2.DataItem(id=str(record_id))
+    item.data.update(payload)
+    return item
+
+
+def _resolve_action(resource: str, actions: Mapping[str, Any]) -> Any:
+    """Look up the handler for ``resource``.
+
+    Raises :class:`~app.domain.inventory.ValidationError` -- an unroutable
+    resource is invalid input -- so it maps to INVALID_ARGUMENT through the
+    same table as every other domain failure. Only ever called after the
+    caller has been authenticated.
+    """
+    handler = actions.get(resource)
+    if handler is None:
+        known = ", ".join(sorted(actions))
+        label = resource or "<empty>"
+        raise inventory.ValidationError(
+            f"Unknown resource '{label}'. Supported values are: {known}."
+        )
+    return handler
+
+
+def _catalog_status(error: CatalogError) -> grpc.StatusCode:
+    """Map a domain failure onto its gRPC status code."""
+    for error_type, code in _CATALOG_STATUS_CODES.items():
+        if isinstance(error, error_type):
+            return code
+    return grpc.StatusCode.INVALID_ARGUMENT
+
+
+# --------------------------------------------------------------------------
+# Action routing
+#
+# `resource` selects the operation, keeping the Phase E wire contract
+# unchanged: the proto stays generic and each phase registers handlers here.
+# --------------------------------------------------------------------------
+def _create_product(db: DbSession, payload: dict[str, Any], _actor: User) -> str:
+    product = inventory.create_product(db, payload)
+    return f"Product '{product.sku}' created."
+
+
+def _update_product(db: DbSession, payload: dict[str, Any], _actor: User) -> str:
+    product = inventory.update_product(db, payload)
+    return f"Product '{product.sku}' updated."
+
+
+def _get_product(db: DbSession, params: dict[str, Any]) -> list[client_pb2.DataItem]:
+    product = inventory.get_product_from_params(db, params)
+    return [_data_item(product.id, inventory.serialize_product(product))]
+
+
+def _list_products(db: DbSession, params: dict[str, Any]) -> list[client_pb2.DataItem]:
+    return [
+        _data_item(product.id, inventory.serialize_product(product))
+        for product in inventory.list_products(db, params)
+    ]
+
+
+def _create_warehouse(db: DbSession, payload: dict[str, Any], _actor: User) -> str:
+    warehouse = inventory.create_warehouse(db, payload)
+    return f"Warehouse '{warehouse.code}' created."
+
+
+def _get_warehouse(db: DbSession, params: dict[str, Any]) -> list[client_pb2.DataItem]:
+    warehouse = inventory.get_warehouse_from_params(db, params)
+    return [_data_item(warehouse.id, inventory.serialize_warehouse(warehouse))]
+
+
+def _list_warehouses(
+    db: DbSession, params: dict[str, Any]
+) -> list[client_pb2.DataItem]:
+    return [
+        _data_item(warehouse.id, inventory.serialize_warehouse(warehouse))
+        for warehouse in inventory.list_warehouses(db, params)
+    ]
+
+
+def _set_initial_stock(db: DbSession, payload: dict[str, Any], _actor: User) -> str:
+    record = inventory.set_initial_stock(db, payload)
+    return (
+        f"Initial stock set for '{record.product.sku}' in "
+        f"'{record.warehouse.code}': {record.quantity}."
+    )
+
+
+def _add_stock(db: DbSession, payload: dict[str, Any], _actor: User) -> str:
+    record = inventory.add_stock(db, payload)
+    return (
+        f"Stock for '{record.product.sku}' in '{record.warehouse.code}' "
+        f"is now {record.quantity}."
+    )
+
+
+def _get_stock(db: DbSession, params: dict[str, Any]) -> list[client_pb2.DataItem]:
+    record = inventory.get_stock(db, params)
+    return [_data_item(record.id, inventory.serialize_inventory(record))]
+
+
+def _list_warehouse_inventory(
+    db: DbSession, params: dict[str, Any]
+) -> list[client_pb2.DataItem]:
+    return [
+        _data_item(record.id, inventory.serialize_inventory(record))
+        for record in inventory.list_warehouse_inventory(db, params)
+    ]
+
+
+def _list_low_stock(db: DbSession, params: dict[str, Any]) -> list[client_pb2.DataItem]:
+    return [
+        _data_item(record.id, inventory.serialize_inventory(record))
+        for record in inventory.list_low_stock(db, params)
+    ]
+
+
+def _create_supplier(db: DbSession, payload: dict[str, Any], _actor: User) -> str:
+    supplier = inventory.create_supplier(db, payload)
+    return f"Supplier '{supplier.name}' created."
+
+
+def _associate_supplier_product(
+    db: DbSession, payload: dict[str, Any], _actor: User
+) -> str:
+    link = inventory.associate_supplier_product(db, payload)
+    return (
+        f"Supplier '{link.supplier.name}' linked to product '{link.product.sku}' "
+        f"at {link.unit_cost} with a {link.lead_time_days}-day lead time."
+    )
+
+
+def _list_suppliers(db: DbSession, params: dict[str, Any]) -> list[client_pb2.DataItem]:
+    return [
+        _data_item(supplier.id, inventory.serialize_supplier(supplier))
+        for supplier in inventory.list_suppliers(db, params)
+    ]
+
+
+def _place_order(db: DbSession, payload: dict[str, Any], actor: User) -> str:
+    order = orders.place_order(db, actor, payload)
+    return (
+        f"Order {order.order_number} placed: {len(order.items)} line(s), "
+        f"total {order.total_amount}, status {order.status}."
+    )
+
+
+#: resource -> write handler. Each returns the message for StatusResponse.
+POST_ACTIONS: Final[dict[str, Callable[[DbSession, dict[str, Any], User], str]]] = {
+    "product.create": _create_product,
+    "product.update": _update_product,
+    "warehouse.create": _create_warehouse,
+    "inventory.set_initial_stock": _set_initial_stock,
+    "inventory.add_stock": _add_stock,
+    "supplier.create": _create_supplier,
+    "supplier.associate_product": _associate_supplier_product,
+    "order.place": _place_order,
+}
+
+#: resource -> read handler. Each returns rows to serialize into DataItems.
+GET_ACTIONS: Final[
+    dict[str, Callable[[DbSession, dict[str, Any]], list[client_pb2.DataItem]]]
+] = {
+    "product": _get_product,
+    "products": _list_products,
+    "warehouse": _get_warehouse,
+    "warehouses": _list_warehouses,
+    "inventory.stock": _get_stock,
+    "inventory.warehouse": _list_warehouse_inventory,
+    "inventory.low_stock": _list_low_stock,
+    "suppliers": _list_suppliers,
+}
+
+_CATALOG_STATUS_CODES: Final[dict[type[CatalogError], grpc.StatusCode]] = {
+    # Listed before the broader classes: the request was well formed, the
+    # warehouse simply cannot satisfy it right now.
+    orders.InsufficientStockError: grpc.StatusCode.FAILED_PRECONDITION,
+    inventory.NotFoundError: grpc.StatusCode.NOT_FOUND,
+    inventory.DuplicateError: grpc.StatusCode.ALREADY_EXISTS,
+    inventory.ValidationError: grpc.StatusCode.INVALID_ARGUMENT,
+}
 
 
 class ClientService(client_pb2_grpc.ClientServiceServicer):
@@ -179,12 +379,41 @@ class ClientService(client_pb2_grpc.ClientServiceServicer):
     def post(
         self, request: client_pb2.PostRequest, context: grpc.ServicerContext
     ) -> client_pb2.StatusResponse:
-        self._authenticated_stub(request.session_token, context, "post")
+        try:
+            # Authenticate before resolving the action. The reverse order
+            # would let an unauthenticated caller discover which resources
+            # exist by comparing INVALID_ARGUMENT against UNAUTHENTICATED.
+            with self._authenticated(request.session_token, context) as (
+                db,
+                authenticated,
+            ):
+                handler = _resolve_action(request.resource, POST_ACTIONS)
+                message = handler(
+                    db, _struct_to_dict(request.payload), authenticated.user
+                )
+        except CatalogError as exc:
+            _abort(context, _catalog_status(exc), str(exc))
+
+        return client_pb2.StatusResponse(success=True, message=message)
 
     def get(
         self, request: client_pb2.GetRequest, context: grpc.ServicerContext
     ) -> client_pb2.GetResponse:
-        self._authenticated_stub(request.session_token, context, "get")
+        try:
+            # Authenticated first, for the same reason as `post`.
+            with self._authenticated(request.session_token, context) as (db, _):
+                handler = _resolve_action(request.resource, GET_ACTIONS)
+                # Serialized inside the transaction: rows are read here and
+                # only plain values leave the block.
+                items = handler(db, _struct_to_dict(request.params))
+        except CatalogError as exc:
+            _abort(context, _catalog_status(exc), str(exc))
+
+        return client_pb2.GetResponse(
+            success=True,
+            message=f"{len(items)} record(s).",
+            items=items,
+        )
 
     def processBusinessRequest(
         self, request: client_pb2.BusinessRequest, context: grpc.ServicerContext

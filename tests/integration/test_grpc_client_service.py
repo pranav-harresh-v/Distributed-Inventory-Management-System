@@ -7,13 +7,15 @@ back. They are the proof that the wire contract and the storage layer agree.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import grpc
 import pytest
 from sqlalchemy.orm import Session as DbSession
 from sqlalchemy.orm import sessionmaker
 
 from app.domain import auth
-from app.storage.models import User
+from app.storage.models import User, utc_now
 from app.storage.repositories import SessionRepository
 from proto import client_pb2, client_pb2_grpc
 from tests.conftest import TEST_PASSWORD
@@ -32,16 +34,19 @@ def test_full_login_use_logout_cycle(stub: Stub, auth_user: User) -> None:
     token = login.session_token
     assert token
 
-    # An authenticated Phase F RPC reports UNIMPLEMENTED, not UNAUTHENTICATED.
-    with pytest.raises(grpc.RpcError) as excinfo:
-        stub.get(client_pb2.GetRequest(session_token=token, resource="inventory"))
-    assert excinfo.value.code() == grpc.StatusCode.UNIMPLEMENTED
+    # A valid token reaches a real handler (step 23 routes "products").
+    assert (
+        stub.get(
+            client_pb2.GetRequest(session_token=token, resource="products")
+        ).success
+        is True
+    )
 
     assert stub.logout(client_pb2.LogoutRequest(session_token=token)).success is True
 
     # After logout the same token must stop working immediately.
     with pytest.raises(grpc.RpcError) as excinfo:
-        stub.get(client_pb2.GetRequest(session_token=token, resource="inventory"))
+        stub.get(client_pb2.GetRequest(session_token=token, resource="products"))
     assert excinfo.value.code() == grpc.StatusCode.UNAUTHENTICATED
 
 
@@ -118,21 +123,32 @@ def test_stub_rpcs_require_authentication(
     assert excinfo.value.code() == grpc.StatusCode.UNAUTHENTICATED
 
 
-@pytest.mark.parametrize("rpc_name", ["post", "get", "processBusinessRequest"])
-def test_stub_rpcs_are_unimplemented_when_authenticated(
+def test_process_business_request_is_still_unimplemented(
+    stub: Stub, auth_user: User
+) -> None:
+    """post/get were routed in Phase F step 23; this one is still a stub."""
+    token = _login(stub, auth_user.username, TEST_PASSWORD).session_token
+    with pytest.raises(grpc.RpcError) as excinfo:
+        stub.processBusinessRequest(
+            client_pb2.BusinessRequest(
+                session_token=token, operation="place_order", request_id="r-1"
+            )
+        )
+    assert excinfo.value.code() == grpc.StatusCode.UNIMPLEMENTED
+
+
+@pytest.mark.parametrize("rpc_name", ["post", "get"])
+def test_routed_rpcs_reject_an_unknown_resource(
     stub: Stub, auth_user: User, rpc_name: str
 ) -> None:
     token = _login(stub, auth_user.username, TEST_PASSWORD).session_token
     requests = {
-        "post": client_pb2.PostRequest(session_token=token, resource="order"),
-        "get": client_pb2.GetRequest(session_token=token, resource="inventory"),
-        "processBusinessRequest": client_pb2.BusinessRequest(
-            session_token=token, operation="place_order", request_id="r-1"
-        ),
+        "post": client_pb2.PostRequest(session_token=token, resource="no.such.action"),
+        "get": client_pb2.GetRequest(session_token=token, resource="no.such.action"),
     }
     with pytest.raises(grpc.RpcError) as excinfo:
         getattr(stub, rpc_name)(requests[rpc_name])
-    assert excinfo.value.code() == grpc.StatusCode.UNIMPLEMENTED
+    assert excinfo.value.code() == grpc.StatusCode.INVALID_ARGUMENT
 
 
 def test_two_logins_issue_independent_sessions(stub: Stub, auth_user: User) -> None:
@@ -144,13 +160,85 @@ def test_two_logins_issue_independent_sessions(stub: Stub, auth_user: User) -> N
     stub.logout(client_pb2.LogoutRequest(session_token=first))
 
     with pytest.raises(grpc.RpcError) as excinfo:
-        stub.get(client_pb2.GetRequest(session_token=first, resource="x"))
+        stub.get(client_pb2.GetRequest(session_token=first, resource="products"))
     assert excinfo.value.code() == grpc.StatusCode.UNAUTHENTICATED
 
-    # The second session is untouched: it reaches the not-implemented stub.
+    # The second session is untouched and still serves real reads.
+    assert (
+        stub.get(
+            client_pb2.GetRequest(session_token=second, resource="products")
+        ).success
+        is True
+    )
+
+
+def test_expired_session_is_rejected_over_grpc(
+    stub: Stub, auth_user: User, session_factory: sessionmaker[DbSession]
+) -> None:
+    """Expiry is enforced on the server, not merely in the domain layer.
+
+    The TTL is backdated directly in the database rather than by waiting,
+    since the shortest configurable TTL is a minute.
+    """
+    token = _login(stub, auth_user.username, TEST_PASSWORD).session_token
+
+    # The token works right now.
+    assert (
+        stub.get(
+            client_pb2.GetRequest(session_token=token, resource="products")
+        ).success
+        is True
+    )
+
+    with session_factory() as db:
+        record = SessionRepository(db).get_by_token_hash(auth.hash_session_token(token))
+        record.expires_at = utc_now() - timedelta(minutes=1)
+        db.commit()
+
     with pytest.raises(grpc.RpcError) as excinfo:
-        stub.get(client_pb2.GetRequest(session_token=second, resource="x"))
-    assert excinfo.value.code() == grpc.StatusCode.UNIMPLEMENTED
+        stub.get(client_pb2.GetRequest(session_token=token, resource="products"))
+    assert excinfo.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+    # An expired session is also not a valid thing to log out of.
+    with pytest.raises(grpc.RpcError) as excinfo:
+        stub.logout(client_pb2.LogoutRequest(session_token=token))
+    assert excinfo.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+
+def test_unknown_user_and_wrong_password_are_indistinguishable(
+    stub: Stub, auth_user: User
+) -> None:
+    """Login must not leak which usernames exist."""
+    outcomes = []
+    for username, password in [("no-such-user", "x"), (auth_user.username, "wrong")]:
+        with pytest.raises(grpc.RpcError) as excinfo:
+            _login(stub, username, password)
+        outcomes.append((excinfo.value.code(), excinfo.value.details()))
+
+    assert outcomes[0] == outcomes[1]
+    assert outcomes[0][0] == grpc.StatusCode.UNAUTHENTICATED
+    assert auth_user.username not in outcomes[0][1]
+
+
+def test_no_response_over_the_wire_contains_credentials(
+    stub: Stub, auth_user: User
+) -> None:
+    """Sweep every Phase E response for password, hash and token-hash bytes."""
+    login = _login(stub, auth_user.username, TEST_PASSWORD)
+    token = login.session_token
+    token_hash = auth.hash_session_token(token)
+
+    responses = [login, stub.logout(client_pb2.LogoutRequest(session_token=token))]
+    secrets = [
+        TEST_PASSWORD.encode(),
+        auth_user.password_hash.encode(),
+        token_hash.encode(),
+        b"$2b$",
+    ]
+    for response in responses:
+        payload = response.SerializeToString()
+        for secret in secrets:
+            assert secret not in payload, f"{type(response).__name__} leaked a secret"
 
 
 def test_concurrent_requests_are_served(stub: Stub, auth_user: User) -> None:

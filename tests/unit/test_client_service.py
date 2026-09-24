@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import grpc
 import pytest
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session as DbSession
 from sqlalchemy.orm import sessionmaker
 
-from app.api.client_service import ClientService
+from app.api.client_service import INTERNAL_ERROR_MESSAGE, ClientService
 from app.domain import auth
 from app.storage.models import User
 from proto import client_pb2
@@ -178,6 +179,67 @@ def test_logout_rejects_bad_tokens(
     assert excinfo.value.code == grpc.StatusCode.UNAUTHENTICATED
 
 
+# --- unexpected server failure ---------------------------------------------
+class ExplodingSessionFactory:
+    """Session factory that fails the way a real database outage would.
+
+    The exception carries SQL and a driver message, so these tests also
+    prove none of that reaches the client.
+    """
+
+    SQL = "SELECT users.password_hash FROM users WHERE username = 'admin'"
+
+    def __call__(self):
+        raise OperationalError(self.SQL, {}, Exception("disk I/O error"))
+
+
+@pytest.fixture
+def broken_service() -> ClientService:
+    return ClientService(ExplodingSessionFactory())
+
+
+def test_database_failure_during_login_is_internal(
+    broken_service: ClientService,
+) -> None:
+    with pytest.raises(_Aborted) as excinfo:
+        broken_service.login(
+            client_pb2.LoginRequest(username="operator", password=TEST_PASSWORD),
+            FakeContext(),
+        )
+    assert excinfo.value.code == grpc.StatusCode.INTERNAL
+
+
+def test_database_failure_during_authentication_is_internal(
+    broken_service: ClientService,
+) -> None:
+    with pytest.raises(_Aborted) as excinfo:
+        broken_service.get(
+            client_pb2.GetRequest(session_token="any-token", resource="inventory"),
+            FakeContext(),
+        )
+    assert excinfo.value.code == grpc.StatusCode.INTERNAL
+
+
+@pytest.mark.parametrize("rpc", ["login", "logout", "post", "get"])
+def test_internal_errors_never_leak_database_details(
+    broken_service: ClientService, rpc: str
+) -> None:
+    """A driver error must not carry SQL, hashes or a traceback to a client."""
+    requests = {
+        "login": client_pb2.LoginRequest(username="operator", password="x"),
+        "logout": client_pb2.LogoutRequest(session_token="t"),
+        "post": client_pb2.PostRequest(session_token="t", resource="order"),
+        "get": client_pb2.GetRequest(session_token="t", resource="inventory"),
+    }
+    with pytest.raises(_Aborted) as excinfo:
+        getattr(broken_service, rpc)(requests[rpc], FakeContext())
+
+    details = excinfo.value.details
+    assert details == INTERNAL_ERROR_MESSAGE
+    for leak in ("SELECT", "users", "password_hash", "disk I/O", "OperationalError"):
+        assert leak not in details
+
+
 # --- Phase F stubs ---------------------------------------------------------
 def _call_stub(service: ClientService, rpc: str, token: str):
     request = {
@@ -190,14 +252,30 @@ def _call_stub(service: ClientService, rpc: str, token: str):
     return getattr(service, rpc)(request, FakeContext())
 
 
-@pytest.mark.parametrize("rpc", ["post", "get", "processBusinessRequest"])
+@pytest.mark.parametrize("rpc", ["processBusinessRequest"])
 def test_stub_rpcs_are_unimplemented_when_authenticated(
     service: ClientService, auth_user: User, rpc: str
 ) -> None:
+    """Still-unimplemented RPCs report UNIMPLEMENTED once authenticated.
+
+    `post` and `get` left this set in Phase F step 23: they now route to
+    catalogue handlers. `processBusinessRequest` remains a placeholder.
+    """
     token = _login(service, auth_user.username, TEST_PASSWORD)
     with pytest.raises(_Aborted) as excinfo:
         _call_stub(service, rpc, token)
     assert excinfo.value.code == grpc.StatusCode.UNIMPLEMENTED
+
+
+@pytest.mark.parametrize("rpc", ["post", "get"])
+def test_routed_rpcs_reject_an_unknown_resource(
+    service: ClientService, auth_user: User, rpc: str
+) -> None:
+    """An authenticated call naming no registered action is bad input."""
+    token = _login(service, auth_user.username, TEST_PASSWORD)
+    with pytest.raises(_Aborted) as excinfo:
+        _call_stub(service, rpc, token)
+    assert excinfo.value.code == grpc.StatusCode.INVALID_ARGUMENT
 
 
 @pytest.mark.parametrize("rpc", ["post", "get", "processBusinessRequest"])
