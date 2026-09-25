@@ -18,7 +18,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Generic, TypeVar
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, selectinload
 
 from app.storage.database import Base
@@ -86,6 +86,14 @@ class BaseRepository(Generic[ModelT]):
         if limit is not None:
             stmt = stmt.limit(limit)
         return self.session.scalars(stmt).all()
+
+    def count(self) -> int:
+        """Number of rows, counted by the database.
+
+        ``len(repository.list(...))`` would undercount whenever the list hits
+        its limit, which is exactly when an accurate total matters most.
+        """
+        return self.session.scalar(select(func.count()).select_from(self.model)) or 0
 
     def add(self, entity: ModelT) -> ModelT:
         """Stage a new row and flush so it receives its primary key.
@@ -688,6 +696,36 @@ class SalesHistoryRepository(BaseRepository[SalesHistory]):
         return self.session.scalars(
             stmt.order_by(SalesHistory.sold_at, SalesHistory.id)
         ).all()
+
+    def units_by_product_since(
+        self, since: datetime, *, warehouse_id: int | None = None
+    ) -> Sequence[tuple[int, int]]:
+        """Units sold per product in a window, heaviest seller first.
+
+        Aggregated by the database rather than by loading every row and
+        summing in Python: a reporting caller wants one number per product,
+        and shipping the whole sales history to get it would not scale past a
+        demo. Returns ``(product_id, units)`` pairs.
+
+        Ties break on ``product_id`` so the ordering is total, not merely
+        sorted -- two products with equal sales always come back in the same
+        sequence, which is what lets a report built on this be reproducible.
+
+        Revenue is deliberately absent. Summing a ``Money`` column through
+        SQL would hand back a float, and this project keeps currency exact by
+        never letting it become one; a caller needing revenue should total
+        the loaded rows as Decimals instead.
+        """
+        units = func.sum(SalesHistory.quantity)
+        stmt = (
+            select(SalesHistory.product_id, units)
+            .where(SalesHistory.sold_at >= self._as_stored(since))
+            .group_by(SalesHistory.product_id)
+            .order_by(units.desc(), SalesHistory.product_id)
+        )
+        if warehouse_id is not None:
+            stmt = stmt.where(SalesHistory.warehouse_id == warehouse_id)
+        return [(row[0], int(row[1])) for row in self.session.execute(stmt).all()]
 
     def create(
         self,

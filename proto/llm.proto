@@ -1,0 +1,116 @@
+// LLM-facing gRPC contract for the Distributed Inventory Management System.
+//
+// This is the ONLY way the application server reaches the LLM. The two run as
+// separate processes per the assignment's AI Integration requirement ("this
+// shall be on a separate server which will be accessed by other nodes"), and
+// they speak gRPC and nothing else.
+//
+// The direction of the dependency is the point of the whole design:
+//
+//   client --gRPC--> application server --gRPC--> LLM server --HTTP--> Ollama
+//                           |                         |
+//                        SQLite                  (no database)
+//
+//   * The application server owns all business state. It reads SQLite, builds
+//     the `context` below, and asks a question.
+//   * The LLM server owns no state. It never opens a node's database and has
+//     no path to change inventory: it receives a question plus the facts
+//     needed to answer it, and returns prose. The LLM is advisory only.
+//   * Ollama is an implementation detail of the LLM server and is never
+//     exposed through this contract. No host, model tag, prompt template or
+//     raw Ollama response shape appears here, so the runtime behind the
+//     service could be replaced without a wire change.
+//
+// Conventions, kept identical to proto/client.proto:
+//   * The method name is spelled exactly as the course assignment writes it
+//     (`getLLMAnswer`), which is why it is camelCase rather than the protobuf
+//     style guide's PascalCase. The assignment's "Function Signatures"
+//     section is the graded contract; `processBusinessRequest` in
+//     client.proto is named under the same rule.
+//   * The package is `inventory.<service>.v1`, matching `inventory.client.v1`.
+//   * Field numbers stay in 1-15 so they encode in a single byte.
+//   * Structured payloads travel as google.protobuf.Struct, so a new kind of
+//     question needs handler code rather than a new wire contract.
+
+syntax = "proto3";
+
+package inventory.llm.v1;
+
+import "google/protobuf/struct.proto";
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+// The inference surface offered to application nodes.
+//
+// No session token appears anywhere in this file: the service is internal to
+// the deployment and is never reachable by a client. A client request is
+// authenticated by the application server long before it becomes a call here.
+service LLMService {
+  // Answer one question about inventory (assignment: getLLMAnswer(requestId,
+  // query, context)).
+  //
+  // Failures are reported as gRPC status codes rather than as a field in the
+  // response: UNAVAILABLE when the model runtime cannot be reached,
+  // DEADLINE_EXCEEDED when generation outruns the caller's timeout,
+  // INVALID_ARGUMENT for an unknown query_type. That is why the response
+  // carries no `success` flag, unlike the replies in client.proto -- the
+  // assignment defines this one as getLLMAnswerResponse(requestId, answer),
+  // and a second error channel beside the status code could only ever
+  // disagree with it.
+  rpc getLLMAnswer(GetLLMAnswerRequest) returns (GetLLMAnswerResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
+
+message GetLLMAnswerRequest {
+  // Caller-supplied correlation id (the assignment's requestId), echoed back
+  // in the response so a node can match a reply to an in-flight request. It
+  // carries no authority and is not used as a cache key.
+  string request_id = 1;
+
+  // Which analysis is being requested. One of:
+  //
+  //   "DEMAND_FORECAST"        -- expected demand, read from sales history
+  //   "REORDER_RECOMMENDATION" -- what to reorder, and roughly how much
+  //   "INVENTORY_SUMMARY"      -- prose summary of inventory analytics
+  //
+  // A string rather than an enum, mirroring how client.proto selects an
+  // operation by `resource`: the set is expected to grow, and adding a value
+  // should cost a handler registration rather than a regenerated contract on
+  // every node. The LLM server validates this and rejects anything else.
+  string query_type = 2;
+
+  // The question in natural language. Human-readable and safe to log.
+  string query = 3;
+
+  // The facts the answer must be grounded in -- stock levels, sales
+  // aggregates, supplier lead times -- gathered from SQLite by the
+  // application server, because the LLM server cannot read a database.
+  //
+  // A Struct rather than a fixed message: each query_type needs a different
+  // shape, and pinning them here would force a proto change per analysis.
+  // Monetary amounts arrive as decimal STRINGS, never numbers, because a
+  // Struct stores numbers as doubles and a double cannot hold an exact price.
+  google.protobuf.Struct context = 4;
+}
+
+message GetLLMAnswerResponse {
+  // Echoes GetLLMAnswerRequest.request_id.
+  string request_id = 1;
+
+  // The generated answer, as prose meant for a human reader.
+  //
+  // Advisory only. Nothing downstream parses this into an inventory
+  // mutation: every quantity the system acts on is computed deterministically
+  // by the application server, so a hallucinated number cannot move stock.
+  string answer = 2;
+
+  // The model that produced the answer, e.g. "phi3:mini". Returned so an
+  // answer can be attributed after the fact, and so a node can notice that
+  // the model it reached is not the one it expected.
+  string model = 3;
+}

@@ -13,6 +13,7 @@ credential, hash or stack trace crosses the wire.
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any, Final, NoReturn
@@ -25,6 +26,14 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session as DbSession
 from sqlalchemy.orm import sessionmaker
 
+from app.api import business_service
+from app.api.llm_client import (
+    LLMClient,
+    LLMClientError,
+    LLMRequestError,
+    LLMTimeoutError,
+    LLMUnavailableError,
+)
 from app.domain import auth, inventory, orders
 from app.domain.inventory import CatalogError
 from app.storage.database import SessionLocal, session_scope
@@ -266,6 +275,26 @@ GET_ACTIONS: Final[
     "suppliers": _list_suppliers,
 }
 
+#: Failures reaching the LLM node. Separate from the catalogue table because
+#: these are infrastructure faults rather than anything the caller got wrong:
+#: the same request may well succeed once the node is back.
+_LLM_STATUS_CODES: Final[dict[type[LLMClientError], grpc.StatusCode]] = {
+    LLMTimeoutError: grpc.StatusCode.DEADLINE_EXCEEDED,
+    LLMUnavailableError: grpc.StatusCode.UNAVAILABLE,
+    # The LLM node rejected what this server sent it, which makes it a bug on
+    # this side of the wire and nothing the client can act on.
+    LLMRequestError: grpc.StatusCode.INTERNAL,
+}
+
+
+def _llm_status(error: LLMClientError) -> grpc.StatusCode:
+    """Map an LLM-node failure onto its gRPC status code."""
+    for error_type, code in _LLM_STATUS_CODES.items():
+        if isinstance(error, error_type):
+            return code
+    return grpc.StatusCode.INTERNAL
+
+
 _CATALOG_STATUS_CODES: Final[dict[type[CatalogError], grpc.StatusCode]] = {
     # Listed before the broader classes: the request was well formed, the
     # warehouse simply cannot satisfy it right now.
@@ -284,8 +313,29 @@ class ClientService(client_pb2_grpc.ClientServiceServicer):
     ``SessionLocal``.
     """
 
-    def __init__(self, session_factory: sessionmaker[DbSession] | None = None) -> None:
+    def __init__(
+        self,
+        session_factory: sessionmaker[DbSession] | None = None,
+        *,
+        llm_client: LLMClient | None = None,
+    ) -> None:
         self._session_factory = session_factory or SessionLocal
+        self._llm_client = llm_client
+        self._llm_lock = threading.Lock()
+
+    def _llm(self) -> LLMClient:
+        """The LLM node client, built on first use.
+
+        Deferred rather than created in ``__init__`` so that a servicer which
+        never runs an AI operation -- most of the test suite -- never opens a
+        channel it will not use. The lock keeps two concurrent first requests
+        from building two.
+        """
+        if self._llm_client is None:
+            with self._llm_lock:
+                if self._llm_client is None:
+                    self._llm_client = LLMClient()
+        return self._llm_client
 
     # -- shared authentication ---------------------------------------------
     @contextmanager
@@ -418,6 +468,55 @@ class ClientService(client_pb2_grpc.ClientServiceServicer):
     def processBusinessRequest(
         self, request: client_pb2.BusinessRequest, context: grpc.ServicerContext
     ) -> client_pb2.BusinessResponse:
-        self._authenticated_stub(
-            request.session_token, context, "processBusinessRequest"
+        """Run one AI-assisted analysis and return advice.
+
+        The client reaches the model only through here: it has no address for
+        the LLM node and no contract to call it with. This node authenticates
+        the caller, reads its own database, builds the context and makes that
+        call itself.
+
+        Nothing in the reply can move stock. The figures come from the domain
+        layer before the model sees them, and the prose that comes back is
+        never parsed into a quantity.
+        """
+        # Generated when absent so every answer is correlatable, and so
+        # Milestone 2 has an id to key a replicated command on.
+        request_id = request.request_id.strip() or business_service.new_request_id()
+
+        try:
+            # Authenticated before the operation is resolved, for the same
+            # reason as `post` and `get`.
+            with self._authenticated(request.session_token, context) as (db, _):
+                operation, llm_context, question = business_service.prepare(
+                    db, request.operation, _struct_to_dict(request.payload)
+                )
+        except CatalogError as exc:
+            _abort(context, _catalog_status(exc), str(exc))
+
+        # Outside the transaction on purpose. Generation can take the best
+        # part of a minute, and holding a SQLite transaction open across it
+        # would pin one of the pool's connections for the whole wait while
+        # reading nothing.
+        try:
+            answer = self._llm().get_llm_answer(
+                request_id, operation.query_type, question, llm_context
+            )
+        except LLMClientError as exc:
+            _abort(context, _llm_status(exc), str(exc))
+
+        _logger.info(
+            "business request %s completed (%s)", request_id, operation.query_type
         )
+
+        response = client_pb2.BusinessResponse(
+            success=True,
+            message=(
+                f"{operation.query_type} advisory answer generated by "
+                f"{answer.model}."
+            ),
+            request_id=request_id,
+        )
+        response.data.update(
+            business_service.serialize_answer(operation, answer, llm_context)
+        )
+        return response

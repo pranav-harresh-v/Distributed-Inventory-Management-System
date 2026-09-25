@@ -123,10 +123,15 @@ def test_stub_rpcs_require_authentication(
     assert excinfo.value.code() == grpc.StatusCode.UNAUTHENTICATED
 
 
-def test_process_business_request_is_still_unimplemented(
+def test_process_business_request_rejects_an_unknown_operation(
     stub: Stub, auth_user: User
 ) -> None:
-    """post/get were routed in Phase F step 23; this one is still a stub."""
+    """Phase G routed this RPC, so an unrecognised operation is bad input.
+
+    It reported UNIMPLEMENTED while it was a stub. Now it dispatches from its
+    own table of AI operations, and `place_order` is not in it -- the same
+    failure `post` and `get` give for an unknown resource.
+    """
     token = _login(stub, auth_user.username, TEST_PASSWORD).session_token
     with pytest.raises(grpc.RpcError) as excinfo:
         stub.processBusinessRequest(
@@ -134,7 +139,8 @@ def test_process_business_request_is_still_unimplemented(
                 session_token=token, operation="place_order", request_id="r-1"
             )
         )
-    assert excinfo.value.code() == grpc.StatusCode.UNIMPLEMENTED
+    assert excinfo.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert "Supported values are" in excinfo.value.details()
 
 
 @pytest.mark.parametrize("rpc_name", ["post", "get"])

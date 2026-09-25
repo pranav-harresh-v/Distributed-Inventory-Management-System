@@ -240,7 +240,7 @@ def test_internal_errors_never_leak_database_details(
         assert leak not in details
 
 
-# --- Phase F stubs ---------------------------------------------------------
+# --- action routing --------------------------------------------------------
 def _call_stub(service: ClientService, rpc: str, token: str):
     request = {
         "post": client_pb2.PostRequest(session_token=token, resource="order"),
@@ -252,26 +252,17 @@ def _call_stub(service: ClientService, rpc: str, token: str):
     return getattr(service, rpc)(request, FakeContext())
 
 
-@pytest.mark.parametrize("rpc", ["processBusinessRequest"])
-def test_stub_rpcs_are_unimplemented_when_authenticated(
-    service: ClientService, auth_user: User, rpc: str
-) -> None:
-    """Still-unimplemented RPCs report UNIMPLEMENTED once authenticated.
-
-    `post` and `get` left this set in Phase F step 23: they now route to
-    catalogue handlers. `processBusinessRequest` remains a placeholder.
-    """
-    token = _login(service, auth_user.username, TEST_PASSWORD)
-    with pytest.raises(_Aborted) as excinfo:
-        _call_stub(service, rpc, token)
-    assert excinfo.value.code == grpc.StatusCode.UNIMPLEMENTED
-
-
-@pytest.mark.parametrize("rpc", ["post", "get"])
+@pytest.mark.parametrize("rpc", ["post", "get", "processBusinessRequest"])
 def test_routed_rpcs_reject_an_unknown_resource(
     service: ClientService, auth_user: User, rpc: str
 ) -> None:
-    """An authenticated call naming no registered action is bad input."""
+    """An authenticated call naming no registered action is bad input.
+
+    All three routed RPCs behave alike now. `processBusinessRequest` joined
+    them in Phase G, where it stopped being a stub returning UNIMPLEMENTED
+    and gained its own table of AI operations; `place_order` below is not one
+    of them, which makes it the same kind of error as an unknown resource.
+    """
     token = _login(service, auth_user.username, TEST_PASSWORD)
     with pytest.raises(_Aborted) as excinfo:
         _call_stub(service, rpc, token)

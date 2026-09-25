@@ -1,12 +1,12 @@
 # Distributed Inventory Management System -- runtime dependencies
 #
-# Milestone 1, storage/database foundation.
+# Milestone 1: storage/database foundation, gRPC services, LLM integration.
 #
-# This lists only packages the implemented source actually imports, plus the
-# protobuf toolchain needed to compile proto/client.proto. The Streamlit
-# client, Ollama/LLM server and forecasting code are not written yet, so
-# streamlit, ollama, pandas, numpy and plotly are deliberately absent; add
-# each one in the phase that introduces it.
+# This lists the packages the implemented source imports, plus the protobuf
+# toolchain needed to compile proto/*.proto and the Ollama client the Phase G
+# LLM server generates with. The Streamlit client and the plotting/dataframe
+# code are not written yet, so streamlit, pandas, numpy and plotly are
+# deliberately absent; add each one in the phase that introduces it.
 #
 # Pinned to the versions verified working on Python 3.12.10.
 # Transitive dependencies (greenlet, typing-extensions, pluggy, ...) are
@@ -35,6 +35,22 @@ grpcio-tools==1.84.0
 # declares protobuf>=7.35.1,<8.0.0; this is the version resolved into the
 # working environment.
 protobuf==7.36.2
+
+# HTTP transport underneath the Ollama client, imported directly by
+# llm/ollama_client.py. The ollama package translates a refused connection
+# but lets httpx.TimeoutException through untouched, so the adapter catches
+# that type by name to stop a transport exception escaping into the gRPC
+# layer. It arrives transitively via ollama as well; it is pinned here
+# because the source imports it, which is this file's rule.
+httpx==0.28.1
+
+# Official Ollama client. Used by the Phase G LLM server to generate against
+# the local Ollama runtime over HTTP (default http://127.0.0.1:11434).
+# Only the LLM server imports it: the application server reaches the LLM over
+# gRPC and never calls Ollama directly. Declared now, ahead of that code
+# landing, so one install prepares a working checkout.
+# Pulls in httpx and pydantic transitively; both are left unpinned.
+ollama==0.6.2
 
 # Test runner and fixtures for tests/.
 # A development dependency, kept here so a single install prepares a

@@ -232,6 +232,91 @@ and state transitions.
 
 ------------------------------------------------------------------------
 
+## Running the LLM Demonstration
+
+The LLM runs as its own gRPC service on port 50052, separate from the
+application server on 50051. The application server reaches it over gRPC
+and never talks to Ollama itself.
+
+The automated test suite does **not** need any of this: it fakes the model
+runtime, so `pytest` passes on a machine with no Ollama and no model
+downloaded. The steps below are for seeing a real model answer.
+
+### 1. Start Ollama
+
+Ollama must be running locally and listening on its default port:
+
+``` bash
+ollama serve
+```
+
+On Windows and macOS the desktop app usually starts it already. Confirm it
+is up:
+
+``` bash
+ollama list
+```
+
+### 2. Verify the model is available
+
+``` bash
+ollama pull phi3:mini
+```
+
+The pull is idempotent, so it is safe to run when the model is already
+there. `ollama list` should then show the tag. To use a tag you already
+have instead, set `OLLAMA_MODEL` (for example `phi3:latest`, which is the
+same 3.8B Mini model under its default tag).
+
+### 3. Start the LLM service
+
+From the repository root, in its own terminal:
+
+``` bash
+python -m llm.server
+```
+
+It should log:
+
+    LLMService listening on 127.0.0.1:50052
+    Ollama runtime: http://127.0.0.1:11434
+    Model: phi3:mini (timeout 60s)
+
+The service starts whether or not Ollama is reachable; a runtime that is
+down shows up as `UNAVAILABLE` on a request rather than as a failure to
+boot.
+
+### 4. Run the demonstration
+
+In another terminal:
+
+``` bash
+python scripts/demo_llm_queries.py
+```
+
+This sends the three Milestone 1 analyses -- `DEMAND_FORECAST`,
+`REORDER_RECOMMENDATION` and `INVENTORY_SUMMARY` -- over gRPC and prints
+the request id, query type, model and answer for each.
+
+Useful flags:
+
+``` bash
+python scripts/demo_llm_queries.py --only REORDER_RECOMMENDATION
+python scripts/demo_llm_queries.py --show-context      # print what the model was sent
+python scripts/demo_llm_queries.py --timeout 300       # slower CPUs
+python scripts/demo_llm_queries.py --address host:port
+```
+
+The script carries mock context in the shape the application server builds
+from SQLite, holds no database session, and cannot change any inventory
+state. It exits 0 when every query is answered and 1 otherwise, and prints
+what to check when the service cannot be reached.
+
+Generation on a CPU takes a few seconds per query, and the first request
+after starting Ollama also pays for loading the model.
+
+------------------------------------------------------------------------
+
 ## Testing
 
 Testing will cover:

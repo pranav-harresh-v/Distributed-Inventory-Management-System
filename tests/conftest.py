@@ -7,6 +7,7 @@ by the test suite.
 
 from __future__ import annotations
 
+import socket
 import sys
 from collections.abc import Iterator
 from decimal import Decimal
@@ -33,6 +34,15 @@ from app.storage.models import Product, User, Warehouse
 #: Password behind the `auth_user` fixture. Test-only, never seeded.
 TEST_PASSWORD = "correct horse battery staple"
 
+#: Ollama's port. Only the LLM node may ever reach it, and never from a test.
+OLLAMA_PORT = 11434
+
+_LOOPBACK_HOSTS = frozenset({"localhost", "::1", "", "0.0.0.0"})
+
+
+def _is_loopback(host: str) -> bool:
+    return host in _LOOPBACK_HOSTS or host.startswith("127.")
+
 
 @pytest.fixture(scope="session", autouse=True)
 def protect_the_node_database() -> Iterator[None]:
@@ -58,6 +68,66 @@ def protect_the_node_database() -> Iterator[None]:
         after.st_size,
         after.st_mtime_ns,
     ), f"the test suite modified {node_db}"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def forbid_the_model_runtime_and_the_network() -> Iterator[None]:
+    """Fail the run if a test reaches a real model runtime or the internet.
+
+    The Phase G suite is meant to pass on a machine with no Ollama installed,
+    no Phi-3 pulled and no network. Every test injects a fake adapter to keep
+    that true -- but "every test remembers to" is a convention, and a
+    convention is exactly what a future test forgets. This turns the
+    convention into a failure, the same way `protect_the_node_database` does
+    for the node's own SQLite file.
+
+    Two things are blocked:
+
+    * constructing a real ``ollama.Client``, which is the only object in the
+      project that can talk to a model runtime;
+    * opening a socket to Ollama's port, or to anything that is not
+      loopback.
+
+    gRPC is untouched: its C core does not go through Python's socket
+    object, so the integration tests keep talking to their own ephemeral
+    ports exactly as before.
+    """
+    import ollama
+
+    real_client = ollama.Client
+    real_connect = socket.socket.connect
+
+    class ForbiddenClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError(
+                "A test tried to construct a real ollama.Client. The suite "
+                "must not depend on a running Ollama or a downloaded model: "
+                "inject a fake adapter instead."
+            )
+
+    def guarded_connect(self: socket.socket, address: object) -> object:
+        if isinstance(address, tuple) and len(address) >= 2:
+            host, port = str(address[0]), address[1]
+            if port == OLLAMA_PORT:
+                raise AssertionError(
+                    f"A test tried to connect to {host}:{port}, the Ollama "
+                    "runtime. Only the LLM node may reach it, and never "
+                    "during tests."
+                )
+            if not _is_loopback(host):
+                raise AssertionError(
+                    f"A test tried to open a network connection to {host}:{port}. "
+                    "The suite must pass without internet access."
+                )
+        return real_connect(self, address)
+
+    ollama.Client = ForbiddenClient
+    socket.socket.connect = guarded_connect
+    try:
+        yield
+    finally:
+        ollama.Client = real_client
+        socket.socket.connect = real_connect
 
 
 @pytest.fixture

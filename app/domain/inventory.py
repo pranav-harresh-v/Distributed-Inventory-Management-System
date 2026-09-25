@@ -1033,6 +1033,8 @@ def associate_supplier_product(db: DbSession, payload: Any) -> SupplierProduct:
 # public names so no other module has to reach for an underscore. If a
 # third consumer appears, these belong in their own module.
 # --------------------------------------------------------------------------
+PRODUCT_KEYS = _PRODUCT_KEYS
+WAREHOUSE_KEYS = _WAREHOUSE_KEYS
 require_mapping = _require_mapping
 reject_unknown_fields = _reject_unknown_fields
 coerce_int = _coerce_int

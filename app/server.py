@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session as DbSession
 from sqlalchemy.orm import sessionmaker
 
 from app.api.client_service import ClientService
+from app.api.llm_client import LLMClient
 from app.storage.database import SessionLocal, get_database_path, init_db
 from proto import client_pb2_grpc
 
@@ -61,6 +62,7 @@ def create_server(
     host: str | None = None,
     port: int | None = None,
     max_workers: int | None = None,
+    llm_client: LLMClient | None = None,
 ) -> tuple[grpc.Server, int]:
     """Build a server bound to ``host:port``.
 
@@ -83,7 +85,7 @@ def create_server(
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=workers))
     client_pb2_grpc.add_ClientServiceServicer_to_server(
-        ClientService(session_factory or SessionLocal), server
+        ClientService(session_factory or SessionLocal, llm_client=llm_client), server
     )
     bound_port = server.add_insecure_port(f"{bind_host}:{bind_port}")
     if bound_port == 0:
