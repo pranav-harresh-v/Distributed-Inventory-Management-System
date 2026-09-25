@@ -11,10 +11,24 @@ produces exactly the same rows as running it once.
 
 Development credentials
 -----------------------
-The demo admin password is ``DEV_ADMIN_PASSWORD`` below -- a throwaway
-value for local development only. It is bcrypt-hashed before it reaches
-the database; no plaintext password is ever stored. Override it with the
-``SEED_ADMIN_PASSWORD`` environment variable. Never reuse it anywhere real.
+Two accounts are seeded, both throwaway values for local development only:
+
+===========  ==========  =========================  ==========================
+Account      Role        Password constant          Environment override
+===========  ==========  =========================  ==========================
+``admin``    ``admin``   ``DEV_ADMIN_PASSWORD``     ``SEED_ADMIN_PASSWORD``
+``user1``    ``staff``   ``DEV_USER_PASSWORD``      ``SEED_USER_PASSWORD``
+===========  ==========  =========================  ==========================
+
+``admin`` drives the admin client (``client/app.py``); ``user1`` is an
+ordinary account for the user client (``client/user_app.py``). Both are
+bcrypt-hashed before they reach the database; no plaintext password is ever
+stored. Never reuse either anywhere real.
+
+The roles differ only in what they *say*: role-based authorization is not
+implemented, so ``user1`` is not currently restricted by the server. The
+account exists so the user client can be driven by something other than the
+administrator.
 """
 
 from __future__ import annotations
@@ -32,7 +46,7 @@ from sqlalchemy.orm import Session
 
 from app.domain import auth
 from app.storage.database import get_database_path, init_db, session_scope
-from app.storage.models import ADMIN_ROLE
+from app.storage.models import ADMIN_ROLE, STAFF_ROLE
 from app.storage.repositories import (
     InventoryRepository,
     ProductRepository,
@@ -46,6 +60,10 @@ from app.storage.repositories import (
 DEV_ADMIN_USERNAME = "admin"
 DEV_ADMIN_EMAIL = "admin@example.com"
 DEV_ADMIN_PASSWORD = "ChangeMe-Dev-Only-123"
+
+DEV_USER_USERNAME = "user1"
+DEV_USER_EMAIL = "user1@example.com"
+DEV_USER_PASSWORD = "User1-Dev-Only-123"
 
 # --- Deterministic demo catalogue ------------------------------------------
 PRODUCTS: tuple[dict[str, object], ...] = (
@@ -147,6 +165,35 @@ def seed_admin_user(session: Session) -> bool:
     return True
 
 
+def seed_demo_user(session: Session) -> bool:
+    """Create the ordinary demo user if absent. True when a row was added.
+
+    Deliberately a copy of :func:`seed_admin_user`'s shape rather than a
+    shared helper the two call: the admin seed is working code that other
+    tooling (``scripts/grpc_smoke_test.py``) imports constants from, and
+    refactoring it to add a second account would put that at risk for no
+    gain. Two short functions that each do one thing are cheaper here than
+    one parameterised function and a changed call site.
+
+    An existing ``user1`` is left untouched, for the same reason the admin
+    is: bcrypt salts differ per call, so re-hashing every run would rewrite
+    the row and clobber a password changed by hand.
+    """
+    users = UserRepository(session)
+    if users.get_by_username(DEV_USER_USERNAME) is not None:
+        return False
+    password = os.environ.get("SEED_USER_PASSWORD", DEV_USER_PASSWORD)
+    users.create(
+        username=DEV_USER_USERNAME,
+        email=DEV_USER_EMAIL,
+        password_hash=hash_password(password),
+        # The role the schema already defines. No new role is invented, and
+        # nothing here enforces it -- see the module docstring.
+        role=STAFF_ROLE,
+    )
+    return True
+
+
 def seed_products(session: Session) -> int:
     products = ProductRepository(session)
     added = 0
@@ -232,6 +279,7 @@ def main() -> int:
     with session_scope() as session:
         counts = {
             "admin user": int(seed_admin_user(session)),
+            "demo user": int(seed_demo_user(session)),
             "products": seed_products(session),
             "warehouses": seed_warehouses(session),
             "inventory rows": seed_inventory(session),

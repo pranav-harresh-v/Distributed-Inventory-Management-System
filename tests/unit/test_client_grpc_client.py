@@ -634,14 +634,47 @@ def test_the_ui_reaches_the_server_only_through_the_transport_layer() -> None:
     assert not any(module.startswith("proto") for module in modules)
 
 
-def test_streamlit_is_confined_to_the_ui_module() -> None:
-    from client import app
+def ui_entrypoints() -> set[Path]:
+    """The modules allowed to import streamlit, named one by one.
 
-    ui = Path(app.__file__).resolve()
+    Listed explicitly rather than matched by a pattern: the point of the
+    test below is to catch a streamlit import appearing somewhere it does
+    not belong, so a rule like "any file ending in _app.py" would let the
+    next such file in unnoticed. Adding an entrypoint is meant to be a
+    deliberate edit here.
+    """
+    from client import app, user_app
+
+    return {Path(app.__file__).resolve(), Path(user_app.__file__).resolve()}
+
+
+def test_streamlit_is_confined_to_the_ui_modules() -> None:
+    """Both entrypoints may import streamlit. Nothing else may.
+
+    In particular `client/grpc_client.py` must stay free of it, which is
+    what lets every test in this file run without a browser.
+    """
+    entrypoints = ui_entrypoints()
+    checked = 0
     for path in client_sources():
-        if path == ui:
+        if path in entrypoints:
             continue
+        checked += 1
         assert "streamlit" not in imported_modules(path.read_text(encoding="utf-8")), path.name
+
+    # The loop must actually inspect something, or this passes vacuously if
+    # the source discovery ever breaks.
+    assert checked, "no non-entrypoint client modules were examined"
+
+
+def test_each_ui_entrypoint_really_is_one() -> None:
+    """The exemption list may only name files that genuinely use streamlit.
+
+    Without this, a stale name left in `ui_entrypoints` would silently
+    exempt a module that no longer needs exempting.
+    """
+    for path in ui_entrypoints():
+        assert "streamlit" in imported_modules(path.read_text(encoding="utf-8")), path.name
 
 
 # --- undoing the Struct round trip ----------------------------------------
@@ -723,3 +756,273 @@ def test_ordering_tolerates_rows_with_different_keys() -> None:
     rows = [{"sku": "SKU-1", "quantity": 5}, {"sku": "SKU-2"}]
 
     assert order_columns(rows) == [{"sku": "SKU-1", "quantity": 5}, {"sku": "SKU-2"}]
+
+
+# --- the user client ------------------------------------------------------
+#
+# `client/user_app.py` is a second Streamlit entrypoint beside the admin
+# client. It is importable for the same reason: main() runs only under
+# __main__. Nothing below renders a widget, opens a channel or needs a
+# browser, Ollama or a database.
+def test_the_user_client_reuses_the_existing_transport() -> None:
+    """It builds no channel, stub or order payload of its own."""
+    from client import user_app
+
+    modules = imported_modules(Path(user_app.__file__).read_text(encoding="utf-8"))
+
+    assert "client.grpc_client" in modules
+    assert "grpc" not in modules
+    assert not any(module.startswith("proto") for module in modules)
+
+
+def test_the_user_client_does_not_import_the_admin_ui() -> None:
+    """The two entrypoints are independent; neither can alter the other."""
+    from client import user_app
+
+    modules = imported_modules(Path(user_app.__file__).read_text(encoding="utf-8"))
+
+    assert "client.app" not in modules
+    assert not any(module.startswith("client.app") for module in modules)
+
+
+def test_every_user_page_has_a_handler() -> None:
+    from client import user_app
+
+    assert set(user_app.PAGE_HANDLERS) == set(user_app.PAGES)
+
+
+def test_the_user_client_offers_no_write_beyond_ordering() -> None:
+    """A shopper's client must not carry catalogue or stock mutations.
+
+    Checked against the source so that adding `create_product` to this UI
+    later is a deliberate act that breaks a test, not an oversight.
+    """
+    from client import user_app
+
+    source = Path(user_app.__file__).read_text(encoding="utf-8")
+    forbidden = (
+        "create_product",
+        "update_product",
+        "create_warehouse",
+        "set_initial_stock",
+        "add_stock",
+        "create_supplier",
+        "associate_supplier_product",
+        "business_request",
+    )
+    for name in forbidden:
+        assert name not in source, name
+
+
+def serializer_keys(serialize: Any, row: Any) -> set[str]:
+    """The keys a serializer actually produces, by running it."""
+    return set(serialize(row))
+
+
+def test_the_user_client_shows_only_product_fields_the_server_returns(
+    product: Any,
+) -> None:
+    """A heading with nothing behind it renders as a blank column, not an error.
+
+    So the columns are checked against what `serialize_product` really
+    returns, by calling it, rather than against a hand-copied list.
+    """
+    from app.domain.inventory import serialize_product
+    from client import user_app
+
+    available = serializer_keys(serialize_product, product)
+
+    for key, _label in user_app.PRODUCT_COLUMNS:
+        assert key in available, key
+
+
+def test_the_user_client_shows_only_stock_fields_the_server_returns(
+    session: Any, product: Any, warehouse: Any
+) -> None:
+    from app.domain.inventory import serialize_inventory
+    from app.storage.models import Inventory
+    from client import user_app
+
+    record = Inventory(
+        warehouse_id=warehouse.id, product_id=product.id, quantity=5, reorder_point=2
+    )
+    session.add(record)
+    session.flush()
+
+    available = serializer_keys(serialize_inventory, record)
+
+    for key, _label in user_app.AVAILABILITY_COLUMNS:
+        assert key in available, key
+
+
+def test_adding_the_same_product_twice_merges_the_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The server consolidates duplicates anyway; the basket should read that way."""
+    from client import user_app
+
+    basket: list[dict[str, Any]] = []
+    monkeypatch.setattr(user_app, "cart", lambda: basket)
+
+    user_app._add_to_cart("SKU-1", 2)
+    user_app._add_to_cart("SKU-2", 1)
+    user_app._add_to_cart("SKU-1", 3)
+
+    assert basket == [{"sku": "SKU-1", "quantity": 5}, {"sku": "SKU-2", "quantity": 1}]
+
+
+def test_the_basket_line_shape_matches_the_order_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lines must carry exactly the keys `order.place` accepts."""
+    from app.domain.orders import ORDER_LINE_FIELDS
+    from client import user_app
+
+    basket: list[dict[str, Any]] = []
+    monkeypatch.setattr(user_app, "cart", lambda: basket)
+    user_app._add_to_cart("SKU-1", 4)
+
+    assert set(basket[0]) <= set(ORDER_LINE_FIELDS)
+    assert basket[0]["quantity"] >= 1
+
+
+def test_a_basket_places_one_order_through_the_existing_rpc() -> None:
+    """End of the line: the same resource string the admin client uses."""
+    client, stub = build(message="Order ORD-1 placed: 2 line(s), total 99.96.")
+
+    result = client.place_order(
+        TOKEN, "WH-1", [{"sku": "SKU-1", "quantity": 2}, {"sku": "SKU-2", "quantity": 1}]
+    )
+
+    assert stub.last.resource == "order.place"
+    sent = payload_of(stub.last)
+    assert sent["warehouse_code"] == "WH-1"
+    assert [line["sku"] for line in sent["items"]] == ["SKU-1", "SKU-2"]
+    assert result.startswith("Order ORD-1 placed")
+
+
+def test_the_user_client_never_reaches_a_database_or_the_model() -> None:
+    """Covered by the package-wide guards, stated here for this file."""
+    from client import user_app
+
+    modules = imported_modules(Path(user_app.__file__).read_text(encoding="utf-8"))
+    for module in modules:
+        root = module.split(".")[0]
+        assert root not in {"sqlalchemy", "sqlite3", "ollama", "httpx"}, module
+        assert not module.startswith("app.storage"), module
+        assert not module.startswith("llm"), module
+
+
+# --- user-client order validation -----------------------------------------
+#
+# These checks are a courtesy that saves a round trip, never a control. The
+# server validates all of it again, so the tests below pin the UI's own
+# behaviour and the last one pins the boundary: the client must not be the
+# thing that decides an order is acceptable.
+@pytest.mark.parametrize(
+    ("sku", "quantity", "fragment"),
+    [
+        (None, 1, "Choose a product"),
+        ("", 1, "Choose a product"),
+        ("SKU-1", None, "Enter a quantity"),
+        ("SKU-1", "", "Enter a quantity"),
+        ("SKU-1", 0, "at least 1"),
+        ("SKU-1", -3, "at least 1"),
+        ("SKU-1", 2.5, "whole number"),
+        ("SKU-1", "abc", "whole number"),
+    ],
+)
+def test_a_bad_order_line_is_caught_in_the_ui(
+    sku: Any, quantity: Any, fragment: str
+) -> None:
+    from client.user_app import validate_line
+
+    problem = validate_line(sku, quantity)
+
+    assert problem is not None
+    assert fragment in problem
+
+
+@pytest.mark.parametrize("quantity", [1, 5, 999, "7", 3.0])
+def test_a_good_order_line_passes(quantity: Any) -> None:
+    from client.user_app import validate_line
+
+    assert validate_line("SKU-1", quantity) is None
+
+
+def test_an_empty_basket_is_refused_before_it_is_sent() -> None:
+    from client.user_app import validate_basket
+
+    problem = validate_basket([])
+
+    assert problem is not None
+    assert "empty" in problem
+
+
+def test_a_basket_with_a_bad_line_names_the_line() -> None:
+    from client.user_app import validate_basket
+
+    problem = validate_basket(
+        [{"sku": "SKU-1", "quantity": 2}, {"sku": "SKU-2", "quantity": 0}]
+    )
+
+    assert problem is not None
+    assert "SKU-2" in problem
+
+
+def test_a_good_basket_passes() -> None:
+    from client.user_app import validate_basket
+
+    basket = [{"sku": "SKU-1", "quantity": 2}, {"sku": "SKU-2", "quantity": 5}]
+
+    assert validate_basket(basket) is None
+
+
+def test_ui_validation_does_not_replace_the_servers() -> None:
+    """The transport sends whatever it is given; the server is the authority.
+
+    If the client ever started filtering lines itself, an order the server
+    would have rejected could be silently reshaped into one it accepts.
+    """
+    client, stub = build()
+
+    # A quantity the UI would refuse still reaches the wire unaltered when
+    # the transport is called directly, because validation lives in the UI
+    # layer and the server is what enforces the rule.
+    client.place_order(TOKEN, "WH-1", [{"sku": "SKU-1", "quantity": 0}])
+
+    sent = payload_of(stub.last)
+    assert sent["items"][0]["quantity"] == 0
+
+
+def test_a_multi_line_basket_is_sent_as_one_order() -> None:
+    """Atomicity is the server's, and it depends on one request, not three."""
+    client, stub = build()
+
+    client.place_order(
+        TOKEN,
+        "WH-1",
+        [
+            {"sku": "SKU-1", "quantity": 2},
+            {"sku": "SKU-2", "quantity": 1},
+            {"sku": "SKU-3", "quantity": 4},
+        ],
+    )
+
+    assert len(stub.calls) == 1
+    sent = payload_of(stub.last)
+    assert len(sent["items"]) == 3
+    assert stub.last.resource == "order.place"
+
+
+def test_the_order_payload_carries_only_contract_fields() -> None:
+    """`order.place` rejects unknown fields, so nothing extra may be sent."""
+    from app.domain.orders import ORDER_LINE_FIELDS, ORDER_REQUEST_FIELDS
+
+    client, stub = build()
+    client.place_order(TOKEN, "WH-1", [{"sku": "SKU-1", "quantity": 2}])
+
+    sent = payload_of(stub.last)
+    assert set(sent) <= set(ORDER_REQUEST_FIELDS)
+    for line in sent["items"]:
+        assert set(line) <= set(ORDER_LINE_FIELDS)
