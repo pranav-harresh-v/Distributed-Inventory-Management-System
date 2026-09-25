@@ -32,6 +32,7 @@ from app.api.llm_client import (
     LLMClient,
     LLMClientError,
     LLMRequestError,
+    LLMResponseError,
     LLMTimeoutError,
     LLMUnavailableError,
     get_llm_target,
@@ -324,8 +325,102 @@ def test_no_grpc_exception_reaches_the_caller() -> None:
 
 
 def test_every_failure_type_shares_one_base() -> None:
-    for error in (LLMUnavailableError, LLMTimeoutError, LLMRequestError):
+    for error in (
+        LLMUnavailableError,
+        LLMTimeoutError,
+        LLMRequestError,
+        LLMResponseError,
+    ):
         assert issubclass(error, LLMClientError)
+
+
+# --- a successful RPC that carried no answer -------------------------------
+#
+# The LLM node rejects an empty completion before it can be returned, so
+# these are replies the current node cannot send. They are pinned down
+# anyway: the application server must not be trusting the far side to stay
+# correct, because an empty advisory delivered as `success = true` reads to
+# a user exactly like real advice.
+@pytest.mark.parametrize(
+    "answer",
+    ["", "   ", "\n\t  \n"],
+    ids=["empty", "spaces", "whitespace"],
+)
+def test_a_blank_answer_is_refused_rather_than_returned(answer: str) -> None:
+    stub = FakeStub(
+        response=llm_pb2.GetLLMAnswerResponse(
+            request_id="req-1", answer=answer, model=MODEL
+        )
+    )
+    client = LLMClient(stub=stub)
+
+    with pytest.raises(LLMResponseError, match="empty answer"):
+        client.get_llm_answer("req-1", "DEMAND_FORECAST")
+
+
+def test_a_blank_answer_is_not_mistaken_for_an_outage() -> None:
+    """A far-side protocol fault, so telling the caller to retry would lie."""
+    stub = FakeStub(
+        response=llm_pb2.GetLLMAnswerResponse(
+            request_id="req-1", answer="", model=MODEL
+        )
+    )
+    client = LLMClient(stub=stub)
+
+    with pytest.raises(LLMResponseError) as caught:
+        client.get_llm_answer("req-1", "DEMAND_FORECAST")
+
+    assert not isinstance(caught.value, (LLMUnavailableError, LLMTimeoutError))
+
+
+def test_a_blank_answer_is_logged_with_its_request_id(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    stub = FakeStub(
+        response=llm_pb2.GetLLMAnswerResponse(
+            request_id="req-88", answer="", model=MODEL
+        )
+    )
+    client = LLMClient(stub=stub)
+
+    with (
+        caplog.at_level(logging.ERROR, logger="app.api.llm_client"),
+        pytest.raises(LLMResponseError),
+    ):
+        client.get_llm_answer("req-88", "DEMAND_FORECAST")
+
+    assert "req-88" in caplog.text
+
+
+def test_an_answer_of_one_character_is_enough() -> None:
+    """The guard rejects blankness, not brevity."""
+    stub = FakeStub(
+        response=llm_pb2.GetLLMAnswerResponse(
+            request_id="req-1", answer=".", model=MODEL
+        )
+    )
+    client = LLMClient(stub=stub)
+
+    assert client.get_llm_answer("req-1", "DEMAND_FORECAST").answer == "."
+
+
+def test_a_missing_model_warns_but_keeps_the_answer(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Attribution metadata, not content -- judged as a mismatched id is."""
+    stub = FakeStub(
+        response=llm_pb2.GetLLMAnswerResponse(
+            request_id="req-1", answer=ANSWER, model=""
+        )
+    )
+    client = LLMClient(stub=stub)
+
+    with caplog.at_level(logging.WARNING, logger="app.api.llm_client"):
+        result = client.get_llm_answer("req-1", "DEMAND_FORECAST")
+
+    assert result.answer == ANSWER
+    assert result.model == ""
+    assert "req-1" in caplog.text
 
 
 def test_a_failure_is_logged_with_its_request_id(

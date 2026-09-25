@@ -31,6 +31,7 @@ from app.api.llm_client import (
     LLMClient,
     LLMClientError,
     LLMRequestError,
+    LLMResponseError,
     LLMTimeoutError,
     LLMUnavailableError,
 )
@@ -284,6 +285,11 @@ _LLM_STATUS_CODES: Final[dict[type[LLMClientError], grpc.StatusCode]] = {
     # The LLM node rejected what this server sent it, which makes it a bug on
     # this side of the wire and nothing the client can act on.
     LLMRequestError: grpc.StatusCode.INTERNAL,
+    # The node answered with nothing usable. INTERNAL rather than UNAVAILABLE:
+    # the node is up and reachable, so telling the client to retry would be a
+    # lie. Listed explicitly, though the fallback below would produce the same
+    # code, so the mapping reads from the table rather than from its absence.
+    LLMResponseError: grpc.StatusCode.INTERNAL,
 }
 
 

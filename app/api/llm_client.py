@@ -61,6 +61,7 @@ __all__ = [
     "LLMClient",
     "LLMClientError",
     "LLMRequestError",
+    "LLMResponseError",
     "LLMTimeoutError",
     "LLMUnavailableError",
     "get_llm_target",
@@ -92,6 +93,24 @@ class LLMRequestError(LLMClientError):
     Raised for an unsupported query type, a missing request id or a context
     that cannot become a Struct. Every one of those is a bug on this side of
     the wire, not a condition a user can fix.
+    """
+
+
+class LLMResponseError(LLMClientError):
+    """The LLM node answered, but not with a usable answer.
+
+    The RPC succeeded -- there is no gRPC status to read the failure from --
+    yet the `answer` field came back blank. That makes it a protocol
+    violation by the far side rather than a transport fault, which is why it
+    is neither :class:`LLMUnavailableError` (retrying changes nothing) nor
+    :class:`LLMRequestError` (this side sent a well-formed request).
+
+    The current LLM node cannot produce this: ``llm/ollama_client.py``
+    already rejects an empty completion before it can be returned. The guard
+    exists because the application server must not depend on that remaining
+    true. Trusting the answer would be the worst of the three failure modes
+    in this module -- an empty advisory reaching a user as ``success = true``
+    is indistinguishable from real advice, whereas an error is not.
     """
 
 
@@ -220,7 +239,8 @@ class LLMClient:
 
         Raises :class:`LLMUnavailableError` if the node cannot be reached,
         :class:`LLMTimeoutError` if it overruns the deadline,
-        :class:`LLMRequestError` if it rejects the request, and
+        :class:`LLMRequestError` if it rejects the request,
+        :class:`LLMResponseError` if it returns a blank answer, and
         :class:`LLMClientError` for anything else.
         """
         request = llm_pb2.GetLLMAnswerRequest(
@@ -242,6 +262,25 @@ class LLMClient:
                 request_id,
                 response.request_id,
             )
+
+        # A successful RPC is not yet a usable answer. Checked here, at the
+        # boundary, so no caller downstream has to decide whether empty prose
+        # counts as advice.
+        if not response.answer.strip():
+            _logger.error(
+                "llm reply for %s carried no answer (model=%r)",
+                request_id,
+                response.model,
+            )
+            raise LLMResponseError(
+                f"The LLM service at {self._target} returned an empty answer."
+            )
+
+        # An absent model tag is attribution metadata, not content. Warned
+        # about rather than raised on, for the same reason as a mismatched
+        # request id above: it is not worth discarding a good answer over.
+        if not response.model.strip():
+            _logger.warning("llm reply for %s named no model", request_id)
 
         return LLMAnswer(
             request_id=response.request_id,

@@ -317,6 +317,75 @@ after starting Ollama also pays for loading the model.
 
 ------------------------------------------------------------------------
 
+## Running the Streamlit Client
+
+The client is a presentation layer. It reaches the application server over
+gRPC and holds no database path of its own: there is no SQLite import, no
+repository import and no address for the LLM node anywhere in `client/`.
+
+    browser --HTTP :8501--> Streamlit --gRPC :50051--> application server
+                                                            |         |
+                                                         SQLite    gRPC :50052 --> LLM
+
+### 1. Prepare the database
+
+Once, from the repository root:
+
+``` bash
+python scripts/init_db.py
+python scripts/seed_data.py
+```
+
+`seed_data.py` creates the demo admin. Its password comes from
+`SEED_ADMIN_PASSWORD`, which defaults to a development-only value printed by
+the script.
+
+### 2. Start the application server
+
+In its own terminal:
+
+``` bash
+python -m app.server
+```
+
+### 3. Start the Streamlit client
+
+``` bash
+streamlit run client/app.py
+```
+
+It opens on <http://localhost:8501>. Sign in with the seeded admin.
+
+The LLM node is only needed for the **AI Insights** page. Start it as
+described above (`python -m llm.server`) before running an analysis; without
+it, the three analyses report `UNAVAILABLE` and every other page keeps
+working.
+
+To point the client at a different node:
+
+``` bash
+INVENTORY_GRPC_HOST=10.0.0.4 INVENTORY_GRPC_PORT=50051 streamlit run client/app.py
+```
+
+### Pages and the RPCs behind them
+
+| Page | RPCs used |
+|---|---|
+| Sign in / out | `login`, `logout` |
+| Dashboard | `get products`, `get warehouses`, `get inventory.low_stock` |
+| Products | `get products`, `post product.create`, `post product.update` |
+| Warehouses | `get warehouses`, `post warehouse.create` |
+| Inventory | `get warehouses`, `get inventory.warehouse`, `post inventory.set_initial_stock`, `post inventory.add_stock` |
+| Orders | `get warehouses`, `get products`, `post order.place` |
+| Suppliers | `get suppliers`, `post supplier.create`, `post supplier.associate_product` |
+| AI Insights | `processBusinessRequest` (`DEMAND_FORECAST`, `REORDER_RECOMMENDATION`, `INVENTORY_SUMMARY`) |
+
+No page computes a total, decides whether stock is sufficient, or subtracts a
+quantity. Those are server invariants, and a second implementation in the UI
+could only ever disagree with the database.
+
+------------------------------------------------------------------------
+
 ## Testing
 
 Testing will cover:

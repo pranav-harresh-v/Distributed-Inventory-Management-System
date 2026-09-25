@@ -39,18 +39,28 @@ MODEL = "phi3:mini"
 
 
 class FakeOllamaClient:
-    """The only fake in the chain: everything else is the real thing."""
+    """The only fake in the chain: everything else is the real thing.
 
-    def __init__(self, *, raises: BaseException | None = None) -> None:
+    ``answer`` exists so a test can hand back blank prose. The real adapter
+    refuses to do that -- ``llm/ollama_client.py`` raises on an empty
+    completion -- which is precisely why it has to be faked here: the guard
+    under test belongs to the *application server*, and the only way to reach
+    it is a far side that has stopped enforcing its own end of the contract.
+    """
+
+    def __init__(
+        self, *, raises: BaseException | None = None, answer: str = ANSWER
+    ) -> None:
         self.model = MODEL
         self.raises = raises
+        self.answer = answer
         self.prompts: list[dict[str, Any]] = []
 
     def generate(self, **kwargs: Any) -> str:
         self.prompts.append(kwargs)
         if self.raises is not None:
             raise self.raises
-        return ANSWER
+        return self.answer
 
 
 @pytest.fixture
@@ -315,6 +325,57 @@ def test_a_generation_timeout_surfaces_as_deadline_exceeded(
             ask(stub, login(stub, auth_user.username), "INVENTORY_SUMMARY")
 
         assert exc.value.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+
+
+@pytest.mark.parametrize("blank", ["", "   \n  "], ids=["empty", "whitespace"])
+def test_a_blank_answer_never_reaches_the_client_as_advice(
+    session_factory: sessionmaker[DbSession],
+    auth_user: Any,
+    estate: None,
+    blank: str,
+) -> None:
+    """INTERNAL, rather than a successful reply carrying empty prose.
+
+    The LLM node is up and the RPC succeeds, so there is no gRPC status for
+    the application server to read this failure from -- it has to notice the
+    empty answer itself. Reporting success would put blank advice in front of
+    a user with ``advisory: true`` beside it, which is the one failure mode in
+    this chain that is indistinguishable from a working answer.
+    """
+    ollama = FakeOllamaClient(answer=blank)
+
+    for stub in both_nodes(session_factory, ollama):
+        with pytest.raises(grpc.RpcError) as exc:
+            ask(stub, login(stub, auth_user.username), "INVENTORY_SUMMARY")
+
+        assert exc.value.code() == grpc.StatusCode.INTERNAL
+        # The model was genuinely reached: this is not an outage in disguise.
+        assert ollama.prompts != []
+
+
+def test_a_blank_answer_leaves_the_database_untouched(
+    session_factory: sessionmaker[DbSession], auth_user: Any, estate: None
+) -> None:
+    """A failed analytics request is still an analytics request: no writes."""
+    from app.storage.models import Inventory, Order, Product
+
+    def snapshot() -> tuple[int, ...]:
+        with session_factory() as db:
+            return (
+                db.query(Product).count(),
+                db.query(Order).count(),
+                db.query(Inventory).count(),
+                sum(row.quantity for row in db.query(Inventory).all()),
+            )
+
+    before = snapshot()
+    ollama = FakeOllamaClient(answer="")
+
+    for stub in both_nodes(session_factory, ollama):
+        with pytest.raises(grpc.RpcError):
+            ask(stub, login(stub, auth_user.username), "INVENTORY_SUMMARY")
+
+    assert snapshot() == before
 
 
 def test_a_dead_llm_node_does_not_take_the_application_down(
