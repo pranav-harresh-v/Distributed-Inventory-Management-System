@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -46,10 +47,19 @@ from sqlalchemy.orm import Session
 
 from app.domain import auth
 from app.storage.database import get_database_path, init_db, session_scope
-from app.storage.models import ADMIN_ROLE, STAFF_ROLE
+from app.storage.models import (
+    ADMIN_ROLE,
+    CURRENCY_EXPONENT,
+    ORDER_COMPLETED,
+    STAFF_ROLE,
+    utc_now,
+)
 from app.storage.repositories import (
     InventoryRepository,
+    OrderItemRepository,
+    OrderRepository,
     ProductRepository,
+    SalesHistoryRepository,
     SupplierProductRepository,
     SupplierRepository,
     UserRepository,
@@ -91,6 +101,17 @@ PRODUCTS: tuple[dict[str, object], ...] = (
         "description": "8-port USB-C docking station",
         "unit_price": Decimal("129.95"),
     },
+    # Added so the demo has something genuinely below its reorder point.
+    # Introduced as a new product rather than by lowering an existing
+    # quantity: the seed skips rows that already exist, so editing a number
+    # would only reach a database created after the edit, while a new
+    # product and its two stock rows land in an already-seeded one too.
+    {
+        "sku": "SKU-1005",
+        "name": "Laptop Stand",
+        "description": "Aluminium adjustable laptop stand",
+        "unit_price": Decimal("39.95"),
+    },
 )
 
 WAREHOUSES: tuple[dict[str, str], ...] = (
@@ -108,6 +129,12 @@ INVENTORY: tuple[tuple[str, str, int, int, int], ...] = (
     ("WH-002", "SKU-1002", 45, 20, 10),
     ("WH-002", "SKU-1003", 12, 10, 5),
     ("WH-002", "SKU-1004", 25, 15, 8),
+    # Low stock is exactly `quantity <= reorder_point` (app.domain.inventory
+    # .is_low_stock). Before these two rows the seed contained none at all,
+    # so the dashboard's low-stock panel, `inventory.low_stock` and any
+    # reorder recommendation had nothing to show.
+    ("WH-001", "SKU-1005", 6, 15, 5),  # clearly below the reorder point
+    ("WH-002", "SKU-1005", 15, 15, 5),  # exactly at it -- the boundary case
 )
 
 SUPPLIERS: tuple[dict[str, str], ...] = (
@@ -132,7 +159,60 @@ SUPPLIER_PRODUCTS: tuple[tuple[str, str, str, Decimal, int, int, bool], ...] = (
     ("Nimbus Components", "SKU-1003", "NC-MON-03", Decimal("182.40"), 14, 5, False),
     ("Vertex Peripherals", "SKU-1003", "VP-MON-27", Decimal("176.75"), 10, 5, True),
     ("Vertex Peripherals", "SKU-1004", "VP-DOCK-8", Decimal("86.30"), 9, 10, True),
+    # The low-stock product needs supplier terms, or a reorder
+    # recommendation for it has no cost or lead time to reason about.
+    ("Nimbus Components", "SKU-1005", "NC-STD-05", Decimal("21.75"), 6, 20, True),
+    ("Vertex Peripherals", "SKU-1005", "VP-STD-AL", Decimal("23.40"), 4, 15, False),
 )
+
+
+# --- Historical sales, for the forecasting and reorder demonstrations ------
+#
+# `sales_history.order_id` is a NOT NULL foreign key, so history cannot exist
+# without orders to hang it on. These orders are therefore seeded *because*
+# the forecast needs them, which is the "specific demonstration purpose" that
+# justifies them; they are not decoration. Their numbers carry a `SEED-ORD-`
+# prefix so they are distinguishable at a glance from the `ORD-` numbers
+# `place_order` generates during a live demo.
+#
+# Dates are relative to now, not absolute. `demand_statistics` looks back a
+# window of days from the moment it is asked, so a fixed calendar date would
+# quietly slide out of that window and leave the forecast with no data --
+# the demo would break by doing nothing.
+#
+# The shape is deliberate: SKU-1001 rises from 3/day to 7/day across the
+# window, which is well past TREND_SENSITIVITY (10%) and shows as a rising
+# trend; 15 distinct selling days is well past SPARSE_DAY_THRESHOLD (3), so
+# the rate reads as evidence rather than arithmetic. SKU-1005 sells steadily
+# while sitting below its reorder point, which is what makes a reorder
+# recommendation for it worth asking for.
+#
+# Warehouse WH-001 throughout: a forecast is per (product, warehouse), so
+# concentrating history gives one pairing enough depth to be meaningful
+# rather than spreading it too thin across two.
+SALES_WAREHOUSE = "WH-001"
+
+#: (days ago, ((sku, quantity), ...)) -- one seeded order per entry.
+SALES_HISTORY: tuple[tuple[int, tuple[tuple[str, int], ...]], ...] = (
+    (28, (("SKU-1001", 3), ("SKU-1002", 1))),
+    (26, (("SKU-1001", 2),)),
+    (24, (("SKU-1001", 4), ("SKU-1005", 1))),
+    (22, (("SKU-1001", 3), ("SKU-1002", 2))),
+    (20, (("SKU-1001", 3),)),
+    (18, (("SKU-1001", 4), ("SKU-1005", 2))),
+    (16, (("SKU-1001", 5), ("SKU-1002", 1))),
+    (14, (("SKU-1001", 4),)),
+    (12, (("SKU-1001", 5), ("SKU-1005", 2))),
+    (10, (("SKU-1001", 6), ("SKU-1002", 2))),
+    (8, (("SKU-1001", 5),)),
+    (6, (("SKU-1001", 7), ("SKU-1005", 3))),
+    (4, (("SKU-1001", 6), ("SKU-1002", 3))),
+    (2, (("SKU-1001", 8), ("SKU-1005", 3))),
+    (1, (("SKU-1001", 7),)),
+)
+
+#: Marks an order as seeded rather than placed by a person during the demo.
+SEED_ORDER_PREFIX = "SEED-ORD-"
 
 
 def hash_password(plaintext: str) -> str:
@@ -272,6 +352,82 @@ def seed_supplier_products(session: Session) -> int:
     return added
 
 
+
+def seed_sales_history(session: Session) -> int:
+    """Create the historical orders and their sold lines. Returns rows added.
+
+    Mirrors what :func:`app.domain.orders.place_order` writes -- an order
+    header, one ``order_items`` row per line and one ``sales_history`` row
+    per line -- so the seeded past is the same shape as a real one. It does
+    **not** decrement inventory: the seeded quantities describe stock on hand
+    today, and a warehouse that had since been replenished would look exactly
+    like this. Subtracting them would only invent a second, contradictory
+    history.
+
+    Idempotent on the order number, which is derived from the entry's
+    position, so a rerun adds nothing.
+    """
+    users = UserRepository(session)
+    products = ProductRepository(session)
+    warehouses = WarehouseRepository(session)
+    orders = OrderRepository(session)
+    items = OrderItemRepository(session)
+    sales = SalesHistoryRepository(session)
+
+    actor = users.get_by_username(DEV_ADMIN_USERNAME)
+    warehouse = warehouses.get_by_code(SALES_WAREHOUSE)
+    if actor is None or warehouse is None:
+        raise RuntimeError("seed sales history needs the admin user and WH-001")
+
+    added = 0
+    now = utc_now()
+    for index, (days_ago, lines) in enumerate(SALES_HISTORY, start=1):
+        number = f"{SEED_ORDER_PREFIX}{index:02d}"
+        if orders.get_by_order_number(number) is not None:
+            continue
+
+        sold_at = now - timedelta(days=days_ago)
+        order = orders.create(
+            order_number=number,
+            user_id=actor.id,
+            warehouse_id=warehouse.id,
+            status=ORDER_COMPLETED,
+            total_amount=Decimal("0.00"),
+        )
+
+        total = Decimal("0.00")
+        for sku, quantity in lines:
+            product = products.get_by_sku(sku)
+            if product is None:
+                raise RuntimeError(f"seed sales history refers to unknown {sku}")
+            # The price the sale happened at, taken from the catalogue, so
+            # the arithmetic below matches what place_order would have done.
+            subtotal = (product.unit_price * quantity).quantize(CURRENCY_EXPONENT)
+            total += subtotal
+            items.create(
+                order_id=order.id,
+                product_id=product.id,
+                quantity=quantity,
+                unit_price=product.unit_price,
+                subtotal=subtotal,
+            )
+            sales.create(
+                order_id=order.id,
+                warehouse_id=warehouse.id,
+                product_id=product.id,
+                quantity=quantity,
+                unit_price=product.unit_price,
+                sold_at=sold_at,
+            )
+            added += 1
+
+        order.total_amount = total
+        order.completed_at = sold_at
+        orders.save(order)
+
+    return added
+
+
 def main() -> int:
     # Seeding an uninitialised checkout should just work.
     init_db()
@@ -285,6 +441,7 @@ def main() -> int:
             "inventory rows": seed_inventory(session),
             "suppliers": seed_suppliers(session),
             "supplier products": seed_supplier_products(session),
+            "sales history": seed_sales_history(session),
         }
 
     summary = ", ".join(f"{name}: {count}" for name, count in counts.items())

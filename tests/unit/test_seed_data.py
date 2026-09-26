@@ -29,8 +29,20 @@ from scripts.seed_data import (
     DEV_USER_EMAIL,
     DEV_USER_PASSWORD,
     DEV_USER_USERNAME,
+    INVENTORY,
+    PRODUCTS,
+    SALES_HISTORY,
+    SALES_WAREHOUSE,
+    SEED_ORDER_PREFIX,
+    SUPPLIER_PRODUCTS,
     seed_admin_user,
     seed_demo_user,
+    seed_inventory,
+    seed_products,
+    seed_sales_history,
+    seed_supplier_products,
+    seed_suppliers,
+    seed_warehouses,
 )
 
 
@@ -188,3 +200,202 @@ def test_a_full_reseed_adds_nothing_the_second_time(session: Session) -> None:
     assert first == (1, 1)
     assert second == (0, 0)
     assert len(UserRepository(session).list()) == 2
+
+
+# --- the demo states the catalogue has to be able to show -----------------
+#
+# These assert the *data*, not the code that reads it. The seed's job is to
+# put the system into states worth demonstrating, and a table of numbers can
+# drift out of those states silently.
+def test_the_seed_contains_a_low_stock_row() -> None:
+    """Low stock is exactly quantity <= reorder_point.
+
+    Before this was added the seed contained no such row at all, so the
+    dashboard low-stock panel, `inventory.low_stock` and any reorder
+    recommendation had nothing to show.
+    """
+    low = [(c, s, q, r) for c, s, q, r, _ in INVENTORY if q <= r]
+
+    assert low, "no seeded stock row is at or below its reorder point"
+
+
+def test_the_seed_contains_a_row_exactly_at_the_reorder_point() -> None:
+    """The boundary, which is the case an off-by-one would get wrong."""
+    assert any(q == r for _, _, q, r, _ in INVENTORY)
+
+
+def test_the_seed_contains_normal_and_near_threshold_rows() -> None:
+    normal = [(c, s) for c, s, q, r, _ in INVENTORY if q > r * 1.5]
+    near = [(c, s) for c, s, q, r, _ in INVENTORY if r < q <= r * 1.5]
+
+    assert normal, "every row is low -- nothing shows a healthy warehouse"
+    assert near, "no row sits just above its reorder point"
+
+
+def test_no_seeded_quantity_is_negative() -> None:
+    """The schema forbids it; the seed must not be the thing that tries."""
+    for _code, _sku, quantity, reorder, safety in INVENTORY:
+        assert quantity >= 0
+        assert reorder >= 0
+        assert safety >= 0
+
+
+def test_every_seeded_stock_row_names_a_seeded_product() -> None:
+    skus = {str(spec["sku"]) for spec in PRODUCTS}
+    for _code, sku, *_rest in INVENTORY:
+        assert sku in skus, sku
+
+
+def test_the_low_stock_product_has_supplier_terms() -> None:
+    """A reorder recommendation needs a cost and a lead time to reason about."""
+    low_skus = {sku for _c, sku, q, r, _s in INVENTORY if q <= r}
+    supplied = {sku for _name, sku, *_rest in SUPPLIER_PRODUCTS}
+
+    assert low_skus, "precondition: there is a low-stock product"
+    assert low_skus <= supplied
+
+
+# --- historical sales -----------------------------------------------------
+def test_the_history_is_dense_enough_to_forecast_from() -> None:
+    """Below SPARSE_DAY_THRESHOLD a rate is arithmetic, not evidence."""
+    from app.domain.forecasting import DEFAULT_HISTORY_DAYS, SPARSE_DAY_THRESHOLD
+
+    days = {days_ago for days_ago, _lines in SALES_HISTORY}
+
+    assert len(days) > SPARSE_DAY_THRESHOLD
+    assert max(days) <= DEFAULT_HISTORY_DAYS, "history starts outside the window"
+
+
+def test_the_history_carries_a_trend_worth_showing() -> None:
+    """Flat history makes a forecast demonstration say nothing."""
+    from app.domain.forecasting import TREND_SENSITIVITY
+
+    by_age = {
+        days_ago: sum(q for sku, q in lines if sku == "SKU-1001")
+        for days_ago, lines in SALES_HISTORY
+    }
+    oldest_first = [by_age[key] for key in sorted(by_age, reverse=True)]
+    half = len(oldest_first) // 2
+    older, newer = sum(oldest_first[:half]), sum(oldest_first[half:])
+
+    assert newer > older * (1 + TREND_SENSITIVITY)
+
+
+def test_every_seeded_sale_is_a_positive_quantity() -> None:
+    """ck_sales_history_quantity_positive: the schema rejects zero."""
+    for _days_ago, lines in SALES_HISTORY:
+        assert lines, "an order with no lines"
+        for _sku, quantity in lines:
+            assert quantity > 0
+
+
+def test_seeded_sales_name_real_products_and_a_real_warehouse() -> None:
+    skus = {str(spec["sku"]) for spec in PRODUCTS}
+    warehouses = {code for code, _sku, *_rest in INVENTORY}
+
+    assert SALES_WAREHOUSE in warehouses
+    for _days_ago, lines in SALES_HISTORY:
+        for sku, _quantity in lines:
+            assert sku in skus, sku
+
+
+def seed_everything(session: Session) -> None:
+    seed_admin_user(session)
+    seed_demo_user(session)
+    seed_products(session)
+    seed_warehouses(session)
+    seed_inventory(session)
+    seed_suppliers(session)
+    seed_supplier_products(session)
+    session.flush()
+
+
+def test_sales_history_is_written_with_its_orders(session: Session) -> None:
+    """sales_history.order_id is NOT NULL, so history needs orders."""
+    from app.storage.repositories import (
+        OrderItemRepository,
+        OrderRepository,
+        SalesHistoryRepository,
+    )
+
+    seed_everything(session)
+    added = seed_sales_history(session)
+    session.flush()
+
+    orders = OrderRepository(session).list()
+    sales = SalesHistoryRepository(session).list()
+    items = OrderItemRepository(session).list()
+
+    assert added == sum(len(lines) for _days, lines in SALES_HISTORY)
+    assert len(orders) == len(SALES_HISTORY)
+    assert len(sales) == added
+    assert len(items) == added
+    assert all(row.order_id is not None for row in sales)
+
+
+def test_seeded_orders_are_distinguishable_from_real_ones(
+    session: Session,
+) -> None:
+    """A live demo order gets an ORD- number; these must not look like one."""
+    from app.storage.repositories import OrderRepository
+
+    seed_everything(session)
+    seed_sales_history(session)
+    session.flush()
+
+    for order in OrderRepository(session).list():
+        assert order.order_number.startswith(SEED_ORDER_PREFIX)
+
+
+def test_seeded_orders_total_what_their_lines_come_to(session: Session) -> None:
+    """The same arithmetic place_order does, so the past is a plausible one."""
+    from decimal import Decimal
+
+    from app.storage.repositories import OrderItemRepository, OrderRepository
+
+    seed_everything(session)
+    seed_sales_history(session)
+    session.flush()
+
+    lines_by_order: dict[int, Decimal] = {}
+    for item in OrderItemRepository(session).list():
+        lines_by_order[item.order_id] = (
+            lines_by_order.get(item.order_id, Decimal("0.00")) + item.subtotal
+        )
+
+    for order in OrderRepository(session).list():
+        assert order.total_amount == lines_by_order[order.id]
+        assert order.completed_at is not None
+
+
+def test_seeding_sales_history_twice_adds_nothing(session: Session) -> None:
+    from app.storage.repositories import OrderRepository, SalesHistoryRepository
+
+    seed_everything(session)
+    first = seed_sales_history(session)
+    session.flush()
+    second = seed_sales_history(session)
+    session.flush()
+
+    assert first > 0
+    assert second == 0
+    assert len(OrderRepository(session).list()) == len(SALES_HISTORY)
+    assert len(SalesHistoryRepository(session).list()) == first
+
+
+def test_seeded_history_does_not_move_stock(session: Session) -> None:
+    """Seeded quantities describe stock on hand today, not stock before sales.
+
+    Decrementing here would invent a second, contradictory history.
+    """
+    from app.storage.repositories import InventoryRepository
+
+    seed_everything(session)
+    before = {row.id: row.quantity for row in InventoryRepository(session).list()}
+
+    seed_sales_history(session)
+    session.flush()
+
+    after = {row.id: row.quantity for row in InventoryRepository(session).list()}
+    assert after == before
+    assert all(quantity >= 0 for quantity in after.values())

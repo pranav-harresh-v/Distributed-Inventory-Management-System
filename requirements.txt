@@ -9,9 +9,15 @@
 # that client/app.py exists. pandas, numpy and plotly remain absent: the
 # client renders lists of dicts through st.dataframe and needs none of them.
 #
+# Two entries are not imported by any module and are here anyway, because a
+# single install should prepare a checkout where the documented commands all
+# work: grpcio-tools (regenerating the stubs) and ruff (linting).
+#
 # Pinned to the versions verified working on Python 3.12.10.
-# Transitive dependencies (greenlet, typing-extensions, pluggy, ...) are
-# resolved by pip and intentionally left unpinned.
+# Transitive dependencies (greenlet, typing-extensions, pluggy, pandas,
+# numpy, pydantic, ...) are resolved by pip and intentionally left unpinned:
+# pandas and numpy arrive with streamlit, pydantic with ollama, and no
+# module here imports any of them.
 
 # ORM and SQLite access.
 # Used by app/storage/{database,models,repositories}.py, both scripts and
@@ -65,3 +71,15 @@ streamlit==1.64.0
 # A development dependency, kept here so a single install prepares a
 # working checkout.
 pytest==9.1.1
+
+# Linter. Not imported by any module, and listed for the same reason
+# grpcio-tools is: `ruff check app llm client tests scripts` is a documented
+# step in this project's workflow (PHASE_F_NOTES.md), and `.ruff_cache/` is
+# already gitignored, so one install should prepare a checkout where that
+# command runs. It was in use and undeclared until this audit.
+#
+# pytest-cov is deliberately NOT listed. It is present in the development
+# environment, but nothing imports it, no `--cov` flag is configured, and it
+# is referenced in no script, config file or document -- so on this file's
+# own rule there is nothing to declare.
+ruff==0.16.8
