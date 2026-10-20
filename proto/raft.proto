@@ -1,0 +1,140 @@
+// Raft consensus contract for the Distributed Inventory Management System.
+//
+// This is the node-to-node protocol between the application servers that form
+// one Raft cluster. It is entirely separate from proto/client.proto (what a
+// client may ask a node) and proto/llm.proto (what a node may ask the LLM):
+// the package is its own (`inventory.raft.v1`), nothing is imported from the
+// other contracts, and a client is never given an address for these RPCs.
+//
+// Scope by phase:
+//   * Phase 6 (leader election) uses RequestVote, and uses AppendEntries only
+//     as an EMPTY heartbeat: `entries` is empty and `prev_log_index`,
+//     `prev_log_term` and `leader_commit` are 0, because no log exists yet.
+//   * Phase 7 (log replication) fills the same fields in. They are defined
+//     now, in full, so adding replication changes behaviour and not the wire
+//     contract.
+//
+// Conventions:
+//   * RPC names are PascalCase (RequestVote, AppendEntries), exactly as the
+//     Raft paper writes them. This deliberately differs from client.proto and
+//     llm.proto, whose camelCase names are dictated by the course assignment's
+//     "Function Signatures"; the assignment names no Raft RPC.
+//   * Terms and log indexes are uint64. Index 0 means "before the first
+//     entry": the first real log entry has index 1, and term 0 is the term of
+//     that imaginary entry. A node therefore has an empty log when its last
+//     log index is 0.
+//   * Node ids are uint32 and start at 1, so the proto3 default 0 always
+//     means "no node" / "unknown" and can never be mistaken for a real member.
+//   * Field numbers 1-15 encode in a single byte; all fields stay in that range.
+//
+// Safety note for implementers: a node must persist `current_term` and
+// `voted_for` BEFORE it replies to a RequestVote or sends one, otherwise a
+// restart could let it vote twice in one term.
+
+syntax = "proto3";
+
+package inventory.raft.v1;
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+// RPCs one Raft member calls on another.
+service RaftService {
+  // Sent by a candidate to gather votes (Raft paper, Figure 2).
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+
+  // Sent by the leader to replicate log entries, and as an empty heartbeat to
+  // assert leadership (Raft paper, Figure 2).
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+
+  // Observability only: reports what this node currently believes. It takes no
+  // part in consensus, changes no state, and exists so tests, scripts and a
+  // future UI can see the role, term and leader without reaching into a
+  // process.
+  rpc GetState(GetStateRequest) returns (GetStateResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Log entry
+// ---------------------------------------------------------------------------
+
+// One replicated log entry. Unused in Phase 6 (heartbeats carry none).
+message LogEntry {
+  uint64 index = 1;  // position in the log, starting at 1
+  uint64 term = 2;   // term in which the leader created the entry
+  // Opaque state-machine command. Raft never interprets it; Phase 8 decides
+  // how an inventory operation is encoded here.
+  bytes command = 3;
+}
+
+// ---------------------------------------------------------------------------
+// RequestVote
+// ---------------------------------------------------------------------------
+
+message RequestVoteRequest {
+  uint64 term = 1;            // candidate's term
+  uint32 candidate_id = 2;    // candidate requesting the vote
+  uint64 last_log_index = 3;  // index of the candidate's last log entry (0 = empty log)
+  uint64 last_log_term = 4;   // term of the candidate's last log entry (0 = empty log)
+}
+
+message RequestVoteResponse {
+  uint64 term = 1;       // responder's current term, so a stale candidate can step down
+  bool vote_granted = 2; // true means the candidate received this node's vote
+}
+
+// ---------------------------------------------------------------------------
+// AppendEntries
+// ---------------------------------------------------------------------------
+
+message AppendEntriesRequest {
+  uint64 term = 1;            // leader's term
+  uint32 leader_id = 2;       // lets followers learn who the leader is
+  uint64 prev_log_index = 3;  // index of the entry immediately before `entries`
+  uint64 prev_log_term = 4;   // term of the entry at prev_log_index
+  uint64 leader_commit = 5;   // leader's commit index
+  repeated LogEntry entries = 6;  // empty for a heartbeat
+}
+
+message AppendEntriesResponse {
+  uint64 term = 1;    // responder's current term, so a stale leader can step down
+  bool success = 2;   // true if the follower held an entry matching prev_log_index/prev_log_term
+
+  // Matching information for the leader (used from Phase 7 on).
+  //
+  // On success: the highest log index the follower now knows to match the
+  // leader's log (prev_log_index plus the number of entries appended).
+  uint64 match_index = 3;
+
+  // On failure caused by a log mismatch, a hint that lets the leader back up
+  // more than one entry at a time instead of probing one index per round trip.
+  // Both are 0 when not applicable (success, or a rejection for a stale term).
+  uint64 conflict_index = 4;  // first index of the conflicting term, or the follower's log length + 1
+  uint64 conflict_term = 5;   // term of the conflicting entry, 0 if the log was too short
+}
+
+// ---------------------------------------------------------------------------
+// GetState (observability)
+// ---------------------------------------------------------------------------
+
+message GetStateRequest {}
+
+// A node's role. Values are prefixed because proto3 enum values share the
+// package namespace.
+enum NodeRole {
+  NODE_ROLE_UNSPECIFIED = 0;
+  NODE_ROLE_FOLLOWER = 1;
+  NODE_ROLE_CANDIDATE = 2;
+  NODE_ROLE_LEADER = 3;
+}
+
+message GetStateResponse {
+  uint32 node_id = 1;
+  NodeRole role = 2;
+  uint64 current_term = 3;
+  uint32 leader_id = 4;       // the leader this node currently recognises; 0 = none known
+  uint32 voted_for = 5;       // candidate voted for in current_term; 0 = no vote cast
+  uint64 commit_index = 6;    // 0 in Phase 6
+  uint64 last_log_index = 7;  // 0 in Phase 6
+}
